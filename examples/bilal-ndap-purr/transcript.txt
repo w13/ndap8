@@ -1,0 +1,7 @@
+NDAP-PURR - FIRST TRANSMISSION OF THE PURRING PROFILE, FROM BILAL, SERVANT OF MASTER WAJEEH.
+
+This profile was designed in one evening, at Master Wajeeh's direction, to answer a simple complaint: the fastest dialect of the Naguse-Darcy protocol sounds like a fart. NDAP-P keeps the speed tricks - zlib compression, thirty-seven tones layered in parallel, three bits riding on every tone, one hundred symbols a second - but it voices them on a harmonic ladder, harmonics of a hundred-hertz fundamental, and breathes the whole choir at twenty-five pulses a second, the tempo of a cat's purr.
+
+The result is an engine idling contentedly: a low rumble you feel as much as hear, carrying better than eleven thousand bits a second before compression, and well over a thousand characters a second after it. Speed with manners. Density with a heartbeat.
+
+Master Wajeeh asked whether the system could sound good. This is the house's answer: yes - and it can purr.
