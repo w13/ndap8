@@ -10,11 +10,10 @@ correction capacity (expected decode: EXACT) and one corrupted
 BEYOND capacity (expected result: LOUD failure, never wrong
 bytes).
 
-The corrupted variants exist because of the NDAP-P lesson
-(2026-11-26): an implementation can transmit RS parity and
-never decode it, and clean golden files cannot catch that.
-An implementation that strips parity unread fails the
-correctable-burst file. See the README in the output folder.
+The corrupted variants exist because an implementation can
+transmit RS parity and never decode it, and clean golden
+files cannot catch that. An implementation that strips
+parity unread fails the correctable-burst file. See the README in the output folder.
 
 Run: python3 ndap_conformance.py
 """
@@ -189,17 +188,16 @@ implementation is conformant when, for every mode:
   injected INSIDE the mode's correction capacity — still
   decodes EXACTLY. This file is the point of the set: an
   implementation that transmits RS/convolutional parity but
-  never actually decodes it (the failure found in NDAP-P,
-  2026-11-26) passes the clean golden and fails this one.
+  never actually decodes it passes the clean golden and
+  fails this one.
 - `broken-<mode>.wav` — corrupted BEYOND capacity — fails
   LOUDLY (an error, or a report with ok=False and the failed
   segment indices). Producing wrong bytes is non-conformant
   under all circumstances.
 
-Verified at generation time (2026-11-26): a decoder patched
-to strip RS parity unread — NDAP-P's exact flaw — decodes
-`golden-A`/`golden-B` EXACTLY and fails `corrupt-A`/
-`corrupt-B` loudly. Mode C's correctable burst is 7,920
+Verified at generation time: a decoder patched to strip RS
+parity unread decodes `golden-A`/`golden-B` EXACTLY and fails
+`corrupt-A`/`corrupt-B` loudly. Mode C's correctable burst is 7,920
 samples (165 ms, ~5.5 symbols) of band-wide noise, far
 beyond what any non-decoding receiver survives. The
 correctable-burst sizes are in each `golden-<mode>.json`.

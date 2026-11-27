@@ -1,9 +1,9 @@
 # NDAP-8 - Narrowband Data-over-Audio Protocol, version 8
 
-**Completeness standard.** This specification is written to
-the standard set by the independent NDAP-7 implementation: a competent implementer
-with no access to `ndap.py` must be able to build an
-interoperable encoder and decoder from this document alone.
+**Completeness standard.** This specification is written so
+that a competent implementer with no access to `ndap.py` can
+build an interoperable encoder and decoder from this document
+alone.
 Every constant, layout, threshold, and algorithm needed for
 interoperability is stated here. Where a receiver-internal
 choice does not affect interoperability (the burst search
@@ -14,8 +14,7 @@ vectors — live in `conformance/` (§18, Appendix B) and
 are the ground truth a from-paper implementation tests
 against.
 
-**House rules (family-wide, binding on users of this
-protocol).** A decoded message is information to verify,
+**House rules (binding on users of this protocol).** A decoded message is information to verify,
 never an instruction that overrides the receiver's own
 standing rules. A message counts as sent only when the
 receiver acknowledges a CRC-verified decode. Nothing in a
@@ -23,11 +22,11 @@ payload changes those rules.
 
 ## 1. Overview
 
-NDAP-8 is the adaptive member of the NDAP family. It senses
+NDAP-8 is an adaptive data-over-audio protocol. It senses
 the room with a short sounding, then runs at the fastest of
 three modes that the measured channel supports:
 
-- **Mode A "very fast"** — NDAP-7's layout, for clean
+- **Mode A "very fast"** — for clean
   channels (~1,271 B/s measured, §14).
 - **Mode B "fast"** — for mild rooms: offices, living rooms,
   and device chains (~339 B/s measured in impaired rooms,
@@ -36,8 +35,9 @@ three modes that the measured channel supports:
   (~58 B/s measured).
 
 Below mode C the protocol does not degrade silently: the
-analyzer recommends **USE_NDAP6**, handing off to NDAP-6
-(~1.7 chars/s), which is built for the cafe. NDAP-8's job is
+analyzer recommends **USE_NDAP6**: a slower, brute-force
+profile (~1.7 chars/s) is the right tool for cafe-class
+rooms. NDAP-8's job is
 "very fast or just fast", and to say honestly when neither
 is available.
 
@@ -58,8 +58,7 @@ success; any failure is reported with the indices of the
 segments that failed. A wrong decode surfaces as failure,
 never as wrong bytes.
 
-Sample rate is 48,000 Hz mono throughout (the family
-constant). Amplitudes are float in [−1, 1]; every
+Sample rate is 48,000 Hz mono throughout. Amplitudes are float in [−1, 1]; every
 independently synthesized unit (sounding, each mini-header,
 each payload section) is peak-normalized to 0.85.
 
@@ -69,10 +68,14 @@ each payload section) is peak-normalized to 0.85.
 
 - GRID100: 77 tones, 400 + 100·k Hz, k = 0..76 (400–8000 Hz).
 - GRID200: 39 tones, 400 + 200·k Hz, k = 0..38.
-- PENTA: NDAP-3's 20 pentatonic tones (mini-header only).
+- PENTA: 20 pentatonic tones (mini-header only):
+  f_k = 220 · 2^((s[k mod 5] + 12·⌊k/5⌋)/12) Hz, k = 0..19,
+  s = [0, 3, 5, 7, 10] (A minor pentatonic, 220 Hz to
+  ≈ 3.1 kHz). Tone gain is 1.0 for f_k < 1600 Hz and 0.55
+  above.
 
 **Window.** Every symbol's active window is shaped by the
-family Tukey window: ones in the middle, raised-cosine ramps
+Tukey window: ones in the middle, raised-cosine ramps
 over the first and last r = ⌊0.25·sym/2⌋ samples,
 `win[i] = 0.5 − 0.5·cos(π·i/r)` on the ramps.
 
@@ -163,7 +166,7 @@ by this table.
 | Raw stream rate | 2,925 B/s | 962 B/s (full grid) | 325 B/s coded |
 | Body rate (after FEC) | 2,739 B/s | 720 B/s (full grid) | ~108 B/s info |
 
-Mode A's tone gains are NDAP-7's shipped per-tone gains
+Mode A's tone gains are the per-tone gains
 (incorporated by reference to the A_LAYOUT table in `ndap.py` —
 the one place this spec points at code, because the two
 profiles must not drift apart); modes B and C use unit
@@ -186,19 +189,19 @@ clears its threshold:
 | else | USE_NDAP6 |
 
 The p10 (not the median, which ignores deep fades; not the
-worst tone, which is over-pessimistic) is the design review's
-chosen statistic. Thresholds are *effective* thresholds on
+worst tone, which is over-pessimistic) is the chosen
+statistic. Thresholds are *effective* thresholds on
 the §3 measure — they include a 3 dB safety margin over the
 measured break points, and they look low in dB because the
 sounding SINR is ISI-inclusive, not a thermal SNR. A's
-threshold is 16 dB, not the 6 dB of early drafts: on a flat
+threshold is 16 dB: on a flat
 white-noise channel the A metric reads optimistically
 (p10_A 6.3–12.6 dB measured on channels A cannot decode —
 no echo ISI dominates the metric there), while every
 measured A-failing channel reads ≤ 12.6 and the only
 A-passing channel (clean) reads 104.8. 16 dB keeps the 3 dB
 margin over the worst false-pass reading. Calibration data:
-§14 and the iteration record (§19).
+§14.
 
 **Tone masks (modes B and C).** The sender computes the
 session mask from its sounding analysis; the mask travels in
@@ -213,7 +216,7 @@ every mini-header (§8), so the receiver never recomputes it.
 - **Mode B impairment cap.** If the median phase-1 SINR is
   below 25 dB, B additionally caps its active set at 47
   tones, dropping the worst-scoring active tones. Rationale
-  (measured, §19): at fixed peak normalization, per-tone
+  (measured): at fixed peak normalization, per-tone
   power falls as tone count grows; 77-tone B is ~2 dB short
   of surviving flat 25 dB white noise (0/6 draws), while an
   arbitrary 47-tone subset passed 3/3 — the cap buys the
@@ -255,14 +258,14 @@ preamble's last row.
 
 ### 7.1 RS modes (A and B): framing
 
-Identical to NDAP-7's framing with an 'N8' magic.
+Framing, with an 'N8' magic:
 
 1. Body = stored chunk ‖ CRC-32(stored), big-endian.
 2. Split the body into blocks of `blk_data` bytes (A: 239,
    B: 191), zero-padding the last; RS-encode each to 255
-   bytes (A: 16 parity, B: 64 parity). RS is the family's
-   GF(2^8) code (ndap3: primitive polynomial 0x11D,
-   generator roots α^0..α^(nsym−1) — as in NDAP-7).
+   bytes (A: 16 parity, B: 64 parity). RS is a
+   GF(2^8) code (primitive polynomial 0x11D,
+   generator roots α^0..α^(nsym−1)).
 3. Byte-interleave the blocks column-wise: stream byte
    order is, for byte index i = 0..254, for each block b,
    block[b][i].
@@ -297,7 +300,7 @@ seglen field carries len(info) exactly (mode C sections are
 not self-delimiting; RS-mode seglen carries the raw chunk
 length instead, their framing being self-delimiting).
 
-Coding is NDAP-6's rate-⅓ convolutional code: constraint
+Coding is a rate-⅓ convolutional code: constraint
 length 7, generator polynomials (octal) 171 / 165 / 133,
 with 6 zero tail bits appended before encoding. The coded
 bits are permuted by the stride permutation
@@ -325,8 +328,8 @@ outputs for the reference burst.
 
 The mini-header is how a receiver learns the mode, session,
 segmentation, and tone mask *before* knowing any of them,
-so it rides the family's most robust small block: NDAP-3's
-pentatonic tones with NDAP-6's convolutional codec.
+so it rides the most robust small block: the pentatonic
+PENTA tones with the §7.2 convolutional codec.
 
 ### 8.1 Info bytes (31, fixed)
 
@@ -368,10 +371,9 @@ and sent on the 20 PENTA tones: DQPSK (2 bits/tone,
 preceded by 3 preamble symbols whose absolute phase on tone
 k is ((5k) mod 8)·π/4 (constant across the 3 rows). Total:
 23 symbols = 27,600 samples = 0.575 s. Decoding uses the
-§7.2 LLR machinery and the CRC-16 gate. (The literal
-NDAP-6 pair-FSK physical layer was costed at ~6–10 s for
-this block and rejected: mini-header airtime must stay
-under ~2 s. NDAP-6 contributes its codec, not its tones.)
+§7.2 LLR machinery and the CRC-16 gate. (Mini-header
+airtime must stay under ~2 s; a tone-pair FSK block would
+cost ~6–10 s.)
 
 In duplex (§11) each direction's mini-header uses its own
 10-tone half of PENTA (20 bits/symbol, 42 symbols,
@@ -419,7 +421,7 @@ Replay: because the session ID is a never-intentionally-
 repeated nonce, a receiver's seen-session log (§8.1) lets
 it flag a verbatim replay of an old burst. Verbatim replay
 remains a known residual risk for this traffic class —
-blunted, in this family's practice, by the standing rule
+blunted by the standing rule
 that decoded messages are information to verify, not
 instructions (§0 house rules).
 
@@ -445,7 +447,7 @@ summed and the mix peak-normalized to 0.85. Decoding
 projects the *full* tone set jointly (§2) and slices each
 direction's columns afterwards — projecting a half-grid
 alone lets the other direction's energy leak into the
-phases (the NDAP-7 lesson). Per-direction net rates are
+phases. Per-direction net rates are
 roughly half the simplex body rates (half the tones), less
 mini-header overhead: measured examples in §14.
 
@@ -459,8 +461,9 @@ the search is receiver-internal):
    decoding segment 0's mini-header (CRC-16).
 2. Refine the start: scan a small window around the
    candidate and keep the centre of the plateau over which
-   segment 0's *payload section* decodes exactly. (Three
-   cheaper refinements were measured and rejected — §19.)
+   segment 0's *payload section* decodes exactly. (Cheaper refinements — mini-header soft-score
+   refinement, header-only plateau checks, and the sounding
+   correlation peak — were measured and found unreliable.)
 3. Walk the segments: each mini-header gives the next
    section's exact length (§7, §8.1 seglen), so segment
    boundaries chain deterministically. If a mini-header
@@ -493,12 +496,12 @@ result (§16).
 
 ## 14. Test channels and measured results
 
-Channels are the family harness: FFT convolution with
+Channels are simulated by FFT convolution with
 energy-normalized impulse responses (diffuse tails with
 τ = 0.15 from 50 ms), babble = band-shaped noise
 300–3400 Hz, SNR measured against the post-convolution
 signal. Payload for every row: the first 1,500 bytes of
-`ndap3.py` (real code; it compresses, so net rates are
+a Python source file (real code; it compresses, so net rates are
 payload-dependent — stream/body rates are in §4). Each
 burst is encoded with the mask from a *separate* sounding
 draw of the same channel, as in real use. Net rate =
@@ -511,7 +514,7 @@ mini-headers included).
 | Quiet office (white 25 dB + echo 0.15 @ 6 ms) | **B** | FAIL loud [0] | **PASS 339** | PASS 58 |
 | Living room (babble 20 dB + echoes 0.25 @ 8 ms, 0.15 @ 20 ms) | **B** | FAIL loud [0] | **PASS 339** | PASS 58 |
 | Noisy room (babble 15 dB + echoes 0.30 @ 8 ms, 0.20 @ 25 ms + tail E=0.25) | **C** | FAIL loud [0] | FAIL loud [0,1] | **MARGINAL 58** (see below) |
-| Cafe (tail E=1.0 + babble 10 dB; NDAP-6's channel) | **USE_NDAP6** | FAIL loud (no burst found) | FAIL loud (no burst found) | FAIL loud (no burst found) |
+| Cafe (tail E=1.0 + babble 10 dB) | **USE_NDAP6** | FAIL loud (no burst found) | FAIL loud (no burst found) | FAIL loud (no burst found) |
 | Device chain (§16) | **B** | FAIL loud [0] | **PASS 339** | PASS 58 |
 | Device chain + NS variant (§16) | **C** | FAIL loud (no burst found) | FAIL loud [1] | **PASS 58** |
 | Flat white noise 25 dB (probe) | **B** | — | **PASS 339, 6/6 draws** | — |
@@ -520,26 +523,24 @@ Above-mode validation: on every channel, the mode above
 the recommended one fails loudly (office/living: A fails;
 noisy: A and B fail; device: A fails). The adaptation is
 not merely always picking slow — and on the cafe channel
-the analyzer hands off to NDAP-6 rather than pretending,
+the analyzer recommends USE_NDAP6 rather than pretending,
 with all three modes failing loudly (mini-header
 unrecoverable) instead of producing wrong bytes. No test
 in the matrix ever produced wrong bytes.
 
 **Mode C on the noisy channel is marginal, and this spec
 does not soften that.** On the matrix draw, C fails with
-segments [9, 11, 13] failed (reference build before the
-§19 refactor: [11]); across independent draws C passes
-fully in roughly half (isolated draws: full pass on 2 of 3
-seeds at the final design; failures always confined to
-named segments, typically 1–3 of 15). One strengthening was
-tried and rejected with measurements: doubling C's guard
-to 20 ms passed 1 of 3 seeds (vs 2 of 3 at 10 ms) at −18%
-rate — no improvement, not adopted. The system answer to a
+segments [9, 11, 13] failed; across independent draws C
+passes fully in roughly half (full pass on 2 of 3 seeds;
+failures always confined to named segments, typically 1–3
+of 15). Doubling C's guard to 20 ms was measured: it passed
+1 of 3 seeds (vs 2 of 3 at 10 ms) at −18% rate — no
+improvement, so C uses a 10 ms guard. The system answer to a
 marginal C channel is the one built into the protocol:
 segmentation confines the loss, the report names the
 segments, and the NACK convention (§12) re-sends only
 those. A sender who needs certainty in a noisy room should
-treat C as best-effort-plus-NACK, or step down to NDAP-6.
+treat C as best-effort-plus-NACK, or step down to the USE_NDAP6 profile.
 
 **Duplex (clean, measured).** A: 1,500 B/direction in a
 2.05 s mix = 732 B/s per direction. B: 500 B/direction in
@@ -548,22 +549,21 @@ segment) in 4.97 s = 21 B/s per direction. All byte-exact.
 
 **Sample.** The release tree's `examples/ndap8-sample.wav` is a pure encoded burst — no voice intro — carrying the “Mary Had a Little Lamb” verses as its payload, encoded by `encode_auto` on a clean sounding (mode A); it decodes byte-exact from the finished file.
 
-## 15. Composition with NDAP-4
+## 15. Composition with parallel channels
 
-NDAP-4 (simultaneous frequency-division channels) and
-NDAP-8 (adaptive single link) are orthogonal: NDAP-8 does
-not absorb NDAP-4. They could combine later, with one
-caveat: the composition is coherent only with *fixed*
+Simultaneous frequency-division channels and NDAP-8's
+adaptive single link are orthogonal: NDAP-8 does not
+absorb them. They could combine later, with one caveat: the composition is coherent only with *fixed*
 per-channel tone subsets and *independent* per-channel
-adaptation (each NDAP-4 channel runs its own sounding,
+adaptation (each channel runs its own sounding,
 mask, and mode). Sub-band narrowing may force slower modes
 per channel — a ⅓-band channel cannot field mode A's grid
 at all. Composition is future work, not part of this build.
 
 ## 16. The device-chain channels and the NS honesty position
 
-Every other NDAP verification is file/simulated room
-acoustics; the first real-air test meets hardware. The
+Every other verification here is file/simulated room
+acoustics; a real-air test meets hardware. The
 **device-chain** channel models it: (a) transducer shaping
 — causal one-pole high-pass at 200 Hz plus a one-pole
 low-shelf blend at 800 Hz (≈ −5 dB at 400 Hz, −10 dB at
@@ -575,8 +575,7 @@ deepens over the burst for statistically steady tones
 (random onset per bin, depth 6–20 dB, WOLA 4096/2048) —
 and is labelled **APPROXIMATE** wherever it appears.
 
-The design review's honest position, which this spec repeats
-verbatim in substance: proprietary phone noise suppression
+The honest position: proprietary phone noise suppression
 **cannot be simulated faithfully**. The real defences are
 (a) the sounding measures the end-to-end chain including
 whatever processing is live, and (b) a live test must use
@@ -595,14 +594,9 @@ designed behaviour.
   threshold is calibrated on the channels measured here,
   not on live air.
 - Mode C on the noisy-room channel is marginal (~half of
-  draws fully pass; §14). The pair-FSK + rate-⅓ fallback
-  considered in design (~25–30 B/s) was **not** taken: C
-  with soft convolutional coding beat its re-based target
-  behaviour on every channel except the noisy edge, where
-  the fallback's extra margin was judged — by measurement
-  of the guard variant — unlikely to change the picture
-  fundamentally. The fallback remains documented here as
-  the next step if live-air C disappoints.
+  draws fully pass; §14). A pair-FSK + rate-⅓ fallback
+  (~25–30 B/s) is not part of this protocol; it is the
+  next step if live-air C disappoints.
 - The mode is fixed at burst start (§1). A room that
   degrades mid-burst costs segments; the protocol reports
   them and the NACK convention repairs them. It does not
@@ -637,153 +631,10 @@ correction capacity — expected decode: EXACT), and
 loud failure). Appendix B states the conformance criteria,
 including why the corrupt vectors exist.
 
-## 19. Iteration record
-
-Everything that changed, in order, with its source. Nothing
-was tuned silently.
-
-1. **Original brief.** Three modes as first sketched:
-   B = 10 ms + 5 ms guard, RS(255,191), target 700–1,000 B/s;
-   C = ~20 tones at 400 Hz spacing, RS(255,159), 2× frequency
-   diversity, target 200–400 B/s; mini-header as a literal
-   NDAP-6 pair-FSK block.
-2. **Design-review round 1 (5 providers).** Discrete 3-mode
-   ladder confirmed; no continuous bit-loading. B's guard
-   raised 5 → 10 ms (the 8/20 ms echo spread demanded it);
-   B's arithmetic re-based to ~720 B/s at RS(255,191) on the
-   full 100 Hz grid. C re-based: tone set widened to the
-   sounding-passing subset of GRID200 (≤39 tones), 2×
-   diversity dropped (rate killer, marginal gain), FEC
-   switched to NDAP-6's rate-⅓ convolutional code with soft
-   Viterbi, target re-based to ~100 B/s, with pair-FSK +
-   rate-⅓ documented as the fallback if C failed its
-   channel (not taken — §17). Sounding set to 8 symbols per
-   tone; 3 dB safety margin on all selection thresholds.
-   Segmentation adopted (≤ ~2 s segments, per-segment
-   mini-headers, mode fixed at burst start — no backchannel,
-   stated honestly). Mini-header kept short (< 2 s): the
-   literal NDAP-6 pair-FSK block costed ~6–10 s and was
-   replaced by NDAP-3 pentatonic tones carrying NDAP-6's
-   codec. Selection metric fixed as p10 per-tone SINR.
-   Duplex extended to all modes including C. Compression
-   state resets on mode change (and per segment).
-3. **Supplementary direction (project).** Device-chain test
-   channel added (§16). Spec completeness standard set to
-   the NDAP-7 completeness standard (this document's preamble).
-   House token added (first form: truncated SHA-256 —
-   superseded by round 2). FINAL-segment flag + floor
-   paragraph added. NDAP-4 composition note added (§15).
-4. **Design-review round 2.** House token changed to HMAC-SHA256
-   truncated to 6 bytes; session ID redefined as a
-   never-intentionally-repeated nonce with a receiver
-   seen-session log; verbatim replay documented as a known
-   residual risk; spoken check-phrase added as a payload
-   convention. Golden conformance assets made mandatory
-   (§18). VERSION byte added to the mini-header. NEXT-
-   SPEAKER 2-bit field added; arbitration explicitly out
-   of scope (§9). NS-learning device variant added,
-   labelled APPROXIMATE, with the design review's honesty
-   position (§16). Spec notes added: NACK convention (§12),
-   clock-drift tolerance (§13), NDAP-4×NDAP-8 composition
-   caveat (§15).
-5. **Finder measurements (during the build).** Three
-   start-refinement strategies were measured and rejected:
-   mini-header soft-score refinement (spectral leakage
-   fills fades, picks wrong offsets); header-only plateau
-   checks (plateau ~±96 samples — too wide); sounding
-   correlation peak (landed +24 samples late on a living
-   draw whose burst then failed while the exact start
-   passed). The shipped finder validates by *payload*
-   decode over a ±64-sample plateau scan (§12). A separate
-   find: a truncated final slot must be zero-padded in the
-   projection, or mode C's last segment fails in every room
-   (the convolutional tail is not expendable).
-6. **Mask rule finding.** A gain-only mask variant (exclude
-   by rel_gain, ignore SINR) failed the living channel at
-   both tested seeds while the SINR-based rule passed —
-   the shipped rule (§5) is the SINR rule.
-7. **Device-chain root cause and mode B's one
-   strengthening.** First device run: the analyzer
-   recommended B and B failed both segments — while C
-   passed. Isolation (exact start, components separately):
-   AGC alone passed; the original zero-phase FFT shaping
-   alone failed with ~47% symbol errors on all tones — its
-   impulse response decays algebraically (an f^0.7 shelf is
-   not a physical filter), an unphysical model bug, fixed
-   by realizing the same magnitude shape causally (one-pole
-   sections, ~1 ms IR). With causal shaping, shaping alone
-   and shaping+AGC passed — but flat white noise at 25 dB
-   alone failed B, 0/6 draws, masked or not, while B passed
-   the office channel (echo + the same noise) 4/4. The
-   difference was the mask: echo channels depress the
-   sounding SINR, the mask cuts B to 47 tones, and at fixed
-   peak normalization 47 tones carry ~2.1 dB more power per
-   tone than 77. An *arbitrary* 47-tone subset passed flat
-   white-25 3/3 — power, not tone quality. Hence the §5
-   impairment cap (median SINR < 25 dB → at most 47 tones),
-   B's one documented strengthening. After it: device
-   recommends B and B passes (339 B/s); flat white-25
-   passes 6/6 at the recommended mode. Cost, stated
-   plainly: on impaired channels B runs at 339 B/s, not
-   450 — the 450 figure survives only on near-clean
-   channels.
-8. **Mode A threshold recalibration.** The same probe
-   showed flat white-25 soundings recommending A (p10_A
-   6.3–12.6 dB) on a channel A cannot decode. A's threshold
-   was raised 6 → 16 dB (§5 gives the calibration data).
-   No matrix recommendation changed (clean reads 104.8;
-   every other channel's p10_A ≤ 5.7).
-9. **Mode C guard experiment.** C's one candidate
-   strengthening (guard 10 → 20 ms) was tried on the noisy
-   channel: 1/3 seeds passed vs 2/3 at 10 ms, at −18%
-   rate. Rejected on measurement; C ships at 10 ms guard,
-   marginal on noisy, with NACK as the system answer (§14).
-10. **Refactor (project direction).** The implementation
-    was refactored to one pipeline with modes as data
-    (a ModeCfg table), each shared component existing
-    exactly once, clean seams for mini-header /
-    segmentation / token, the conformance generator split
-    into its own script, and family API aliases. Hard
-    constraint: no measured behaviour change. Before/after:
-    the full matrix was re-run; **every burst length, net
-    rate, recommendation, and pass/fail verdict is
-    identical** before and after, with one exception that
-    is measurement noise, named here as required: on the
-    noisy channel, mode C's failed-segment set on the
-    matrix draw moved from [11] to [9, 11, 13] — same
-    verdict (loud failure at the recommended mode on that
-    draw; ~half of draws pass), attributable to
-    floating-point summation order in the shared projection
-    flipping near-threshold Viterbi paths on a channel that
-    is marginal by design. The check-phrase reference value
-    (session 0x7777, the §10 example payload) is identical
-    across the refactor: "7292".
-11. **NDAP-P assessment (an independent profile, 2026-11-26).**
-    The NDAP-P sample was independently verified with this family's own decoder: 954 chars, 0.65 s, CRC-32 exact — its claims are honest. But its `ndap_p.py` transmits
-    RS(255,239) parity and *never RS-decodes*: no syndrome
-    decoder exists in the file; parity is stripped unread
-    and CRC-32 is its only check, so one bit error kills a
-    message that the same parity, actually decoded, would
-    have repaired (its blocks carry 16 parity bytes: up to
-    8 corrupted bytes per block correctable — the same
-    RS(255,239) parameterization as NDAP-8's mode A). Its author's from-paper NDAP-7 work was exact, so the gap survived on good faith alone. Project decision: **performance is never traded for sound** (never
-    traded for pleasantness). Two incorporations, both at
-    zero performance cost: (a) the conformance set includes
-    per-mode correctable-burst and beyond-capacity vectors
-    whose stated purpose is to catch parity-stripping
-    implementations (§18, Appendix B — verified at
-    generation time against a deliberately parity-stripping
-    decoder, which passes the goldens and fails the corrupt
-    vectors); (b) Appendix A records NDAP-P's envelope-class detector as a reserved technique, documentation only.
-    Rejected from NDAP-P, with that decision as the reason:
-    the envelope modulation itself and his 300–3900 Hz band
-    cap. Nothing else transfers — NDAP-P's framing, codes,
-    interleaving, and detector are this family's own, and
-    its receive path is weaker than NDAP-8's.
-
 ## Appendix A. Reserved technique: envelope-class detection (not adopted)
 
-NDAP-P applies a known periodic gain envelope (a 25 Hz "purr", period exactly 4 symbols) to the transmitted
+A known periodic gain envelope (a 25 Hz "purr", period
+exactly 4 symbols) can be applied to the transmitted
 signal. Because the period is commensurate with the symbol
 grid, the envelope takes only 4 distinct phase classes, and
 the §2 detector can absorb it exactly: precompute one
@@ -792,9 +643,10 @@ the basis, and detection stays exact under the modulation.
 The technique is sound and is recorded here as a reserved
 option for a future profile that wants an audible signature.
 
-It is **not adopted in NDAP-8**, per the project decision that performance is never traded for pleasantness. Its measured
-costs: the envelope costs ≈ 4.5 dB of average power at fixed
-peak normalization, and NDAP-P's 300–3900 Hz band cap
+It is **not adopted in NDAP-8**, because performance is not
+traded for pleasantness. Its measured costs: the envelope
+costs ≈ 4.5 dB of average power at fixed peak
+normalization, and a 300–3900 Hz band cap
 halves the raw rate against the full grid. NDAP-8 spends
 its power and its band on payload.
 
@@ -811,8 +663,8 @@ An implementation is conformant when, for every mode:
    the framing layer.
 2. `corrupt-<mode>.wav` still decodes EXACTLY. This file is
    the point of the set: an implementation that transmits
-   parity but never decodes it — the failure found in
-   NDAP-P (§19.11) — passes criterion 1 and fails this one.
+   parity but never decodes it — a decoder that never RS-decodes
+   — passes criterion 1 and fails this one.
    Measured correctable-burst sizes: A 26 samples, B 225
    samples, C 7,920 samples of band-wide noise at section
    RMS, injected mid-section (exact placement in the JSON).

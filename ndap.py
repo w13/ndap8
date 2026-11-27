@@ -3,16 +3,11 @@
 final implementation (protocol version 8, the adaptive profile).
 
 This single module is the whole NDAP-8 reference implementation
-— no family imports, nothing to keep in step. It senses the
-room and runs at the fastest mode that survives it — "very
-fast or just fast". It sits between the family's maximum-speed
-profile (NDAP-7: uniform grid, 5 ms symbols, ~2,500 B/s, clean
-channels only) and its brute-force cafe profile (NDAP-6:
-tone-pair FSK + bit-level FEC, ~1.7 chars/s, survives the
-simulated cafe). NDAP-8 picks the right tool per room and says
-so. The full specification — written to be implementable from
-the document alone — is SPEC.md; design history lives there
-too.
+— no other imports from the project, nothing to keep in step.
+It senses the room and runs at the fastest mode that survives
+it — "very fast or just fast" — and says so when no mode
+does. The full specification — written to be implementable
+from the document alone — is SPEC.md.
 
 Author: Waqqas Hanafi
 
@@ -25,12 +20,10 @@ Architecture (one pipeline, modes as data):
   guard lengths, bits per tone, code type and rate, segment
   cap, gains). A single section codec (_encode_section /
   _decode_section) is parameterized by the entry; there are
-  no per-mode code paths. The shared machinery — the RS codec
-  (the family's original, from NDAP-3), the rate-1/3
-  convolutional codec (from NDAP-6), the framing/interleave/
+  no per-mode code paths. The shared machinery — the RS codec,
+  the rate-1/3 convolutional codec, the framing/interleave/
   CRC layer, and the augmented [B|conj(B)] projection
-  detector (from NDAP-7) — each exists exactly once, in this
-  file.
+  detector — each exists exactly once, in this file.
 - SOUNDING (0.2 s): phase 1 = 8 symbols x 10 ms on the 77-tone
   100 Hz grid (400-8000 Hz), known phase pattern, no guard —
   the findable preamble and the A/B channel probe. Phase 2 =
@@ -59,7 +52,7 @@ Architecture (one pipeline, modes as data):
   length, the session tone mask, an OPTIONAL 6-byte house
   token (HMAC-SHA256 truncated — origin authentication only,
   never required to decode, off by default), CRC-16 — on
-  the family's 20 pentatonic tones, DQPSK, 25 ms slots,
+  the 20 pentatonic tones, DQPSK, 25 ms slots,
   protected by the rate-1/3 convolutional codec with
   soft-decision Viterbi and a stride interleave. FLOOR
   CONTROL: bursts are exchanged as recordings, not live
@@ -91,7 +84,7 @@ API:
   audio, mode = encode_auto(data, sounding_samples)
   audio = encode_adaptive(data, mode, analysis=None, ...)
   data  = decode_adaptive(samples, start=None)   (raises SegmentError)
-  data  = decode_auto(samples, start=None)       (same, family name)
+  data  = decode_auto(samples, start=None)       (alias)
   rep   = decode_adaptive_report(samples, start=None, house_secret=None)
   rec   = sounding_burst()
   ana   = analyze_channel(samples)
@@ -115,7 +108,7 @@ import numpy as np
 SR = 48000
 
 # ------------------------------------------------------------ WAV IO
-# 48 kHz mono 16-bit WAV read/write — the family file
+# 48 kHz mono 16-bit WAV read/write — the file
 # format for burst exchange.
 
 def write_wav(path: str, samples) -> None:
@@ -135,7 +128,7 @@ def read_wav(path: str):
 
 
 # ------------------------------------------------------------ Reed-Solomon codec
-# The family RS codec over GF(256) (primitive polynomial
+# The RS codec over GF(256) (primitive polynomial
 # 0x11D): one implementation, used by the payload framing
 # and the repeated header blocks.
 
@@ -404,7 +397,7 @@ def _unpermute(bits, P):
 
 def _data_perm_P(L):
     """Deterministic stride derived from the bit length alone, so the
-    encoder and decoder always agree (same rule as NDAP-5)."""
+    encoder and decoder always agree."""
     P = 257
     while math.gcd(P, L) != 1:
         P += 2
@@ -415,10 +408,10 @@ def _crc16(data: bytes) -> int:
     return binascii.crc_hqx(data, 0xFFFF)
 
 # ------------------------------------------------------------ tone layouts
-# The family's tone sets and the one layout class, each defined
-# exactly once. PENTA is the original pentatonic grid (20 tones,
+# The tone sets and the one layout class, each defined
+# exactly once. PENTA is the pentatonic grid (20 tones,
 # A minor, 220 Hz to ~3.1 kHz, top-octave gain taper) — home of
-# the mini-header. A_LAYOUT is the shipped maximum-speed layout
+# the mini-header. A_LAYOUT is the maximum-speed layout
 # (uniform orthogonal grid, 400-8000 Hz at 200 Hz spacing,
 # 5 ms symbols): Mode A's grid.
 PENTA_SEMI = [0, 3, 5, 7, 10]  # A minor pentatonic
@@ -556,7 +549,7 @@ def _onset_candidates(x, sym):
 GRID100 = 400.0 + 100.0 * np.arange(77)      # sounding ph.1 + mode B
 GRID200 = 400.0 + 200.0 * np.arange(39)      # sounding ph.2, modes A/C
 # PENTA — the mini-header tone set — is defined with the
-# layouts above (the family pentatonic grid).
+# layouts above (the pentatonic grid).
 A_TONE_IDX = [int(round((f - 400) / 100)) for f in GRID200]  # in GRID100
 
 # ------------------------------------------------------------ modes (data)
@@ -578,9 +571,8 @@ class ModeCfg:
 
 
 MODES = {
-    # A is the family's shipped maximum-speed layout (the
-    # NDAP-7 sweep winner, grid200 at 5 ms), defined once
-    # above as A_LAYOUT.
+    # A is the maximum-speed layout (grid200 at 5 ms), defined
+    # once above as A_LAYOUT.
     "A": ModeCfg("A", A_LAYOUT.freqs, tuple(A_LAYOUT.gains),
                  A_LAYOUT.sym, 0, 3, "rs", 239, 16, 3400),
     "B": ModeCfg("B", GRID100, (1.0,) * 77, 480, 480, 2, "rs",
@@ -775,7 +767,7 @@ def _synth_steps(steps, cfg: Cfg, guard: int, pre_style, pre_n, win, E):
 
 def _steps_from_bits(bits, cfg: Cfg):
     """Pack a bit array into (nsym, ntones) Gray step indices,
-    tone-major per symbol, MSB-first per tone (the family order)."""
+    tone-major per symbol, MSB-first per tone."""
     bps = cfg.bits_per_sym
     pad = (-len(bits)) % bps
     if pad:
@@ -813,7 +805,7 @@ def _modulate_bits_g(bits, cfg: Cfg, guard: int, pre_n=PREAMBLE):
 
 
 # ------------------------------------------------- framing (one RS layer)
-HDR_DATA, HDR_NSYM = 9, 16                 # header RS(25,9), as NDAP-7
+HDR_DATA, HDR_NSYM = 9, 16                 # header RS(25,9)
 HDR_LEN = HDR_DATA + HDR_NSYM
 CHUNK = 400
 STRIDE = CHUNK + HDR_LEN
@@ -822,7 +814,7 @@ FLAG_COMPRESSED = 0x01
 
 def _frame_rs(stored: bytes, flags: int, blk_data: int,
               blk_nsym: int) -> bytes:
-    """NDAP-7-style framing: CRC-32 over the stored bytes,
+    """Framing: CRC-32 over the stored bytes,
     RS blocks, byte interleaving, and an RS(25,9) header
     (magic 'N8', stored length, block count, flags) repeated
     before every CHUNK of the interleaved stream."""
@@ -898,7 +890,7 @@ def _unframe_rs(stream: bytes, blk_data: int, blk_nsym: int):
 
 
 def _stored_of(chunk: bytes):
-    """The family's compression rule: zlib-9 stored only if
+    """The compression rule: zlib-9 stored only if
     smaller. Returns (stored, flags). Deterministic — the
     decoder recomputes section lengths from decoded chunks.
     Compression is per segment and resets with the mode: a
@@ -1008,7 +1000,7 @@ def _section_samples(mc: ModeCfg, chunk: bytes, seglen: int, mask,
 # the payload pipeline's internals.
 VERSION = 8                        # the version byte NDAP-8 carries
 MINI_INFO = 31                     # fixed for all modes/segments
-MINI_GENS = CODE_GENS        # rate-1/3 convolutional (NDAP-6 codec)
+MINI_GENS = CODE_GENS        # rate-1/3 convolutional codec
 MINI_CODED_BITS = len(MINI_GENS) * (MINI_INFO * 8 + 6)     # 762
 FLAG_FINAL = 0x01                  # set on the last segment only
 FLAG_TOKEN = 0x02                  # house token field is present
@@ -1139,7 +1131,7 @@ def _mini_decode_scored(samples, start: int, cfg=_mini_cfg, full_cfg=None,
     With full_cfg/col_idx (duplex), projection is onto the
     FULL tone set and this direction's columns are sliced
     afterwards — a subset-only projection cannot span the
-    other direction's tones (the NDAP-7 lesson)."""
+    other direction's tones."""
     data_syms = -(-MINI_CODED_BITS // cfg.bits_per_sym)
     proj_cfg = full_cfg if full_cfg is not None else cfg
     coeffs = _slots_coeffs(samples, proj_cfg, MINI_GUARD, start,
@@ -1230,22 +1222,20 @@ def _analyze_at(samples, start: int, idx1=None, idx2=None):
 
 # Mode-selection thresholds on the 10th-percentile per-tone
 # sounding SINR. These are EFFECTIVE thresholds: measured break
-# points plus the design review's 3 dB safety margin (see spec §5).
+# points plus a 3 dB safety margin (see spec §5).
 # The sounding SINR is an ISI-inclusive effective measure at the
 # sounding's own timing, not a thermal SNR — hence the low dB
 # values for the guarded modes.
-# A's threshold was raised from 6 to 16 dB after flat
+# A's threshold is 16 dB because flat
 # white-noise soundings read p10_A 6.3-12.6 dB on a channel A
 # cannot decode (the A sounding metric is optimistic when no
 # echo ISI dominates it); every measured A-failing channel
 # reads <= 12.6 and the only A-passing one (clean) reads
 # 104.8, so 16 dB keeps the 3 dB margin over the worst
-# false-pass reading. See the spec's iteration record.
+# false-pass reading. See spec §5 and §14.
 THR_P10 = {"A": 16.0, "B": -12.0, "C": 5.0}
 
-# Mode B impairment cap (its one documented strengthening,
-# added after the device-chain tests — see the spec's
-# iteration record): at fixed peak normalization, per-tone
+# Mode B impairment cap (see spec §5): at fixed peak normalization, per-tone
 # power falls as the tone count grows, and 77-tone B measured
 # ~2 dB short of surviving flat 25 dB white noise (0/6 draws)
 # while an arbitrary 47-tone subset passed 3/3. When the
@@ -1623,8 +1613,7 @@ def decode_adaptive(samples, start=None) -> bytes:
     return rep["data"]
 
 
-# Family-name aliases (ndap7's entry points are encode_fast /
-# decode_fast; NDAP-8's adaptive entries answer to both).
+# Aliases for the adaptive entry points.
 decode_auto = decode_adaptive
 encode_fast = encode_adaptive
 decode_fast = decode_adaptive
