@@ -347,8 +347,9 @@ PENTA tones with the §7.2 convolutional codec.
 | 23–28 | house token (6 bytes; zeros when absent) |
 | 29–30 | CRC-16 (BE) over bytes 0–28 |
 
-CRC-16 is CRC-HQX (CCITT-FALSE: polynomial 0x1021, initial
-value 0xFFFF). A mini-header whose CRC fails, whose magic
+CRC-16 is CRC-16/CCITT-FALSE (a.k.a. CRC-HQX): polynomial
+0x1021, initial value 0xFFFF, no input reflection, no output
+reflection, no final XOR. A mini-header whose CRC fails, whose magic
 is wrong, or whose VERSION is not 8 is invalid: the
 receiver treats the burst as not found (loudly), never
 guesses. The version byte is how a receiver knows what it

@@ -1163,6 +1163,12 @@ def _tone_feats(snr_db, rel_gain):
     g = np.asarray(rel_gain, dtype=float)
     ok = ~np.isnan(s)
     s, g = s[ok], g[ok]
+    if s.size == 0:
+        # No usable tone (degenerate recording): clearly degenerate
+        # figures, which can never clear a threshold.
+        return {k: float("nan") for k in (
+            "median_snr_db", "p10_snr_db", "min_rel_gain",
+            "frac_below_6db", "frac_below_0db")}
     return {
         "median_snr_db": float(np.median(s)),
         "p10_snr_db": float(np.percentile(s, 10)),
@@ -1288,10 +1294,30 @@ def mask_from_analysis(ana, mode: str):
     return [0 if b else 1 for b in bad]
 
 
+def _degenerate_analysis() -> dict:
+    """Analysis for a recording that cannot contain a sounding
+    (empty, too short, silent garbage): NaN figures, and the
+    honest recommendation — USE_NDAP6."""
+    nan = float("nan")
+    feats = _tone_feats([], [])
+    return {
+        "snr_db": np.full(77, nan), "rel_gain": np.full(77, nan),
+        "c_snr_db": np.full(39, nan), "c_rel_gain": np.full(39, nan),
+        "A": dict(feats), "B": dict(feats), "C": dict(feats),
+        "recommendation": "USE_NDAP6", "degenerate": True,
+    }
+
+
 def analyze_channel(samples) -> dict:
-    """Locate the sounding in a recording and analyze it."""
-    off = _find_sounding_offset(samples)
-    return _analyze_at(samples, off)
+    """Locate the sounding in a recording and analyze it. A
+    recording that cannot hold a sounding (empty, too short,
+    unusable) yields a degenerate analysis recommending
+    USE_NDAP6 rather than an exception."""
+    try:
+        off = _find_sounding_offset(samples)
+        return _analyze_at(samples, off)
+    except (ValueError, IndexError):
+        return _degenerate_analysis()
 
 
 # ------------------------------------------------------------ finder
@@ -1736,10 +1762,11 @@ if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "encode":
         mode = sys.argv[4] if len(sys.argv) > 4 else "A"
-        write_wav(sys.argv[3], encode_adaptive(sys.argv[2].encode(), mode))
+        write_wav(sys.argv[3], encode_adaptive(os.fsencode(sys.argv[2]), mode))
         print(f"encoded {len(sys.argv[2])} chars (mode {mode}) -> {sys.argv[3]}")
     elif cmd == "decode":
-        print(decode_adaptive(read_wav(sys.argv[2])).decode())
+        sys.stdout.buffer.write(decode_adaptive(read_wav(sys.argv[2])))
+        sys.stdout.buffer.flush()
     elif cmd == "sounding":
         write_wav(sys.argv[2], sounding_burst())
         print(f"sounding -> {sys.argv[2]}")
@@ -1750,7 +1777,7 @@ if __name__ == "__main__":
             print(f"  mode {m}: " + ", ".join(
                 f"{k}={v:.2f}" for k, v in ana[m].items()))
     elif cmd == "auto":
-        audio, mode = encode_auto(sys.argv[3].encode(),
+        audio, mode = encode_auto(os.fsencode(sys.argv[3]),
                                   read_wav(sys.argv[2]))
         if audio is None:
             print("recommendation: USE_NDAP6 — not encoded")
