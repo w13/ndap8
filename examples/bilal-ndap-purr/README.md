@@ -27,3 +27,12 @@ that house that the fastest dialect "sounds like a fart".
 Those figures are the contributor's, as transmitted; they have not been
 independently verified here, and no NDAP-P encoder/decoder code has been
 received yet. The canonical implementation remains `../../ndap.py`.
+
+## Revision note (8.2)
+
+The file was received, and "verified with the canonical decoder", under
+NDAP-8 **rev 8.0/8.1**. Rev 8.2 is a clean-slate wire format and does not
+decode it (a rev 8.1 header would raise `RevisionError`, a rev 8.1 sounding
+may simply not lock). To reproduce the verification above, use the 8.1
+decoder from git: `git show 48c0756:ndap.py > /tmp/ndap81.py`. The audio and
+transcript are kept as received.

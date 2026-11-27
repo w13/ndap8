@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NDAP-8 conformance-asset generator.
+"""NDAP-8 (rev 8.2) conformance-asset generator.
 
 Builds the conformance/ folder next to this script: for each
 mode, a golden WAV carrying a known payload, a JSON of
@@ -33,14 +33,14 @@ SESSION = 0x8A01
 
 def _constellation(audio, mode):
     """Post-projection coefficients of segment 0's payload
-    section: row 5 (last preamble symbol) and row 6 (first
-    data symbol), all tones, 6-decimal [re, im] pairs."""
+    section: row 0 (the reference preamble symbol) and row 1 (the
+    first data symbol), all tones, 6-decimal [re, im] pairs."""
     mc = MODES[mode]
     cfg, _ = _sel_cfg(mc, [1] * len(mc.grid))
     sec = ndap.SND_LEN + ndap.MINI_LEN
-    coeffs = ndap._slots_coeffs(audio, cfg, mc.guard, sec, 7)
+    coeffs = ndap._slots_coeffs(audio, cfg, mc.guard, sec, 2)
     return {f"row{r}": [[round(float(z.real), 6), round(float(z.imag), 6)]
-                        for z in coeffs[r]] for r in (5, 6)}
+                        for z in coeffs[r]] for r in (0, 1)}
 
 
 def _framing_ref(audio, mode):
@@ -79,7 +79,7 @@ def _corrupt(audio, mode, span, seed):
     mc = MODES[mode]
     sec = ndap.SND_LEN + ndap.MINI_LEN
     chunk = ndap._split_work(PAYLOAD, mc)[0]
-    sec_len = _section_samples(mc, chunk, _seg_stored_len(mc, chunk),
+    sec_len = _section_samples(mc, _seg_stored_len(mc, chunk),
                                [1] * len(mc.grid))
     mid = sec + sec_len // 2
     rng = np.random.default_rng(seed)
@@ -143,7 +143,7 @@ def build_mode(mode):
     # beyond capacity: noise over the whole second half of
     # segment 0's section
     chunk = ndap._split_work(PAYLOAD, mc)[0]
-    sec_len = _section_samples(mc, chunk, _seg_stored_len(mc, chunk),
+    sec_len = _section_samples(mc, _seg_stored_len(mc, chunk),
                                [1] * len(mc.grid))
     broken, bmeta = _corrupt(audio, mode, sec_len // 2, 8200)
     assert _fails_loudly(broken), f"broken {mode} did not fail loudly"
@@ -182,7 +182,7 @@ implementation is conformant when, for every mode:
   `golden-<mode>.json` (sha256 given), and its intermediate
   values match the JSON (mini-header info bytes, framing
   bytes, and the post-projection constellation of segment 0,
-  rows 5 and 6) — the intermediates exist so a failure can be
+  rows 0 and 1) — the intermediates exist so a failure can be
   isolated to the PHY/projection layer vs the framing layer.
 - `corrupt-<mode>.wav` — the golden with an error burst
   injected INSIDE the mode's correction capacity — still

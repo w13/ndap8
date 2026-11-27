@@ -1,13 +1,22 @@
-# NDAP-8 - Narrowband Data-over-Audio Protocol, version 8 (revision 8.1)
+# NDAP-8 - Narrowband Data-over-Audio Protocol, version 8 (revision 8.2)
 
-**Revision 8.1 (2026-11-27).** The on-air format is unchanged:
-the wire `VERSION` byte stays 8, every rev 8.0 burst decodes under
-8.1, and every 8.1 burst is a valid 8.0 burst (§18 vectors are
-byte-identical). What changed is the receiver (§12: correlation
-acquisition with a retry ladder, slow-envelope normalization,
-stricter mini-header validity in §8.1) and one optional
-sender-side addition (§19, the Expression Layer). See
-`CHANGELOG.md`.
+**Revision 8.2 (2026-11-27) — a clean-slate break.** The wire format
+changed freely: 8.2 does not decode 8.0/8.1 bursts and 8.0/8.1 do not
+decode 8.2 bursts. Backward compatibility was dropped on purpose
+(NDAP is being developed for the first time; nothing deployed
+depends on 8.0/8.1). The mini-header's byte 2 is now a *wire
+revision* marker, `0x82` (§8.1): a decoder that meets a CRC-valid
+header announcing another revision raises a named error
+(`RevisionError`) instead of guessing. What changed on the air:
+rectangular (orthogonal) detector windows for A, B and sounding
+phase 1; low-crest Schroeder-phase preamble and chirp-sign sounding;
+a one-symbol payload preamble; shortened RS blocks sized to the
+message; every section's exact stored length in the mini-header; RS(255,223) for B;
+the tone mask on every mode (A included). What changed in the
+receiver: correlation acquisition only (the 8.0 finder is gone),
+per-section timing re-alignment for Mode A, and a chain that survives a failed
+section. Measurements in §14.2; the story in `CHANGELOG.md`.
+**Duplex is carried over and verified (§11).**
 
 **Completeness standard.** This specification is written so
 that a competent implementer with no access to `ndap.py` can
@@ -83,10 +92,19 @@ each payload section) is peak-normalized to 0.85.
   ≈ 3.1 kHz). Tone gain is 1.0 for f_k < 1600 Hz and 0.55
   above.
 
-**Window.** Every symbol's active window is shaped by the
-Tukey window: ones in the middle, raised-cosine ramps
-over the first and last r = ⌊0.25·sym/2⌋ samples,
-`win[i] = 0.5 − 0.5·cos(π·i/r)` on the ramps.
+**Window.** A layout's symbol window is a Tukey window with
+taper fraction τ: ones in the middle, raised-cosine ramps over
+the first and last r = ⌊τ·sym/2⌋ samples,
+`win[i] = 0.5 − 0.5·cos(π·i/r)` on the ramps. Rev 8.2 sets
+**τ = 0 (rectangular) for Mode A, Mode B and sounding phase 1**,
+and keeps τ = 0.25 for Mode C, the mini-header and sounding
+phase 2. Reason (measured): tones spaced at exactly 1/T are
+orthogonal only under a rectangular window; with the 8.1 taper
+the augmented detector of §2 had condition number 32 (A) and 91
+(B), which amplifies noise by about 10 and 17 dB — the whole of
+the 8.1 A/B noise floor. The rectangular detector's condition
+number is 1.0. C's 4×-oversampled layout (cond 1.15) and the
+mini-header keep their taper.
 
 **Synthesis.** For a slot of `active` samples with per-tone
 complex coefficients c_j at frequencies f_j, the slot's
@@ -126,18 +144,31 @@ needed.
 The sounding is 9,600 samples (0.2 s), two phases.
 
 **Phase 1** (the A/B probe and the findable preamble):
-8 symbols × 480 samples (10 ms), no guard, on GRID100, unit
-magnitude per tone, absolute phases
+8 symbols × 480 samples (10 ms), no guard, rectangular window
+(§2), on GRID100, unit magnitude per tone. Every deterministic
+symbol of the format uses **Schroeder phases** — a flat-spectrum
+multisine whose crest factor is low (a chirp that sweeps the
+band once per symbol): for N tones, `S_N[k] = π·k²/N`, k = 0..N−1.
+Symbol n of phase 1 has absolute phases
 
 ```
-φ1[n, k] = base[k] + n · pat[k],   n = 0..7
-base[k] = ((5k) mod 8) · π/4,      pat[k] = (k mod 8) · π/4
+φ1[n, k] = s1[n] · π·k²/77,    s1 = (+1, +1, +1, −1, −1, +1, −1, +1)
 ```
+
+— an up- or down-chirp per symbol (the "dual-chirp" idea),
+in a non-periodic order, so the sounding's autocorrelation has one
+sharp peak with sidelobes ≲ ⅐ of it (no ambiguity at multiples
+of 10 ms). Why Schroeder: the burst is peak-normalized to 0.85, so
+a high-crest deterministic symbol sets the scale and pins every
+data symbol below the speaker's headroom. In 8.1 the sounding and
+preamble crest factors were 19–25 dB against 12–15 dB for data; the
+8.2 sounding is ≈ 8 dB, and the data sections run 6–10 dB louder
+at the same peak.
 
 **Phase 2** (the C probe): 4 symbols at mode C's own timing
-— 960 active + 480 guard samples per slot — on GRID200,
-phases φ2 defined by the same formulas with k = 0..38,
-n = 0..3.
+— 960 active + 480 guard samples per slot, Tukey τ = 0.25 — on
+GRID200, `φ2[n, k] = s2[n] · π·k²/39`, k = 0..38,
+`s2 = (+1, +1, −1, +1)`.
 
 **Analysis.** Project each phase's slots with the §2
 detector at the sounding's own timing. For each tone,
@@ -168,12 +199,14 @@ by this table.
 |---|---|---|---|
 | Grid | GRID200 (39) | GRID100 (77) | GRID200 subset (≤39) |
 | Active / guard | 240 / 0 (5 ms) | 480 / 480 (10+10 ms) | 960 / 480 (20+10 ms) |
+| Window taper τ | 0 (rectangular) | 0 (rectangular) | 0.25 |
 | Modulation | diff. 8-PSK (3 bits/tone) | diff. QPSK (2) | diff. QPSK (2), soft |
-| FEC | RS(255,239) | RS(255,191) | rate-⅓ conv. (§7.2) |
-| Tone selection | none (mask all-ones) | per-tone (§5) | per-tone (§5) |
-| Segment cap (raw chunk) | 3,400 B | 1,050 B | 105 B |
+| FEC | shortened RS, 16 parity (≤ RS(255,239)) | shortened RS, 32 parity (≤ RS(255,223)) | rate-⅓ conv. (§7.2) |
+| Tone selection | optional mask (§5) | per-tone (§5) | per-tone (§5) |
+| Segment cap (raw chunk) | 3,400 B | 1,200 B | 105 B |
 | Raw stream rate | 2,925 B/s | 962 B/s (full grid) | 325 B/s coded |
-| Body rate (after FEC) | 2,739 B/s | 720 B/s (full grid) | ~108 B/s info |
+| Body rate (after FEC, before repeated headers) | 2,742 B/s | 842 B/s (full grid) | ~108 B/s info |
+| Timing plateau (decodes within ±) | ~3 samples | ~70 samples | ≥ 96 samples |
 
 Mode A's tone gains are the per-tone gains
 (incorporated by reference to the A_LAYOUT table in `ndap.py` —
@@ -192,29 +225,39 @@ clears its threshold:
 
 | Mode | p10 threshold |
 |---|---|
-| A | ≥ 16.0 dB |
-| B | ≥ −12.0 dB |
+| A | ≥ 22.0 dB |
+| B | ≥ 18.0 dB |
 | C | ≥ 5.0 dB |
 | else | USE_NDAP6 |
 
 The p10 (not the median, which ignores deep fades; not the
 worst tone, which is over-pessimistic) is the chosen
 statistic. Thresholds are *effective* thresholds on
-the §3 measure — they include a 3 dB safety margin over the
-measured break points, and they look low in dB because the
-sounding SINR is ISI-inclusive, not a thermal SNR. A's
-threshold is 16 dB: on a flat
-white-noise channel the A metric reads optimistically
-(p10_A 6.3–12.6 dB measured on channels A cannot decode —
-no echo ISI dominates the metric there), while every
-measured A-failing channel reads ≤ 12.6 and the only
-A-passing channel (clean) reads 104.8. 16 dB keeps the 3 dB
-margin over the worst false-pass reading. Calibration data:
-§14.
+the §3 measure: break point plus a 3 dB safety margin.
 
-**Tone masks (modes B and C).** The sender computes the
-session mask from its sounding analysis; the mask travels in
-every mini-header (§8), so the receiver never recomputes it.
+**Rev 8.2 calibration, and its limit.** The 8.2 sounding reads a
+tone's own SINR; in flat white noise the p10 reads about
+(whole-burst SNR + 8) dB. The measured whole-burst break points
+(§14.2) are ≈ 11 dB SNR for A and ≈ 7.5 dB for B, i.e. readings of
+≈ 19 and ≈ 15.5 dB; with the 3 dB margin: **A = 22, B = 18**. C is
+carried over from 8.1 unchanged (5 dB): it is the last resort
+before USE_NDAP6 and its white-noise break (≈ −2 dB SNR, reading
+≈ 8) is not margined by 5 — it is lenient. **All of this is
+calibrated on white noise.** The 8.1 thresholds (A 16, B −12, C 5)
+were set on simulated room channels (echoes, babble, device
+chain) that are not in the tree; those channels were not re-run
+for 8.2, so the selector's behaviour in echoey rooms is open work
+(§14.1, §17). The change of direction is the safe one: B is no
+longer recommended on noise it measurably fails (8.1's −12 dB
+threshold recommended B at any reading above −12).
+
+**Tone masks.** The sender computes the
+session mask from its sounding analysis (modes B and C); the
+mask travels in every mini-header (§8), so the receiver never
+recomputes it. Rev 8.2 carries the mask for **every** mode: Mode
+A's analysis-driven mask is still all-ones, but a sender that
+knows its channel (a 250–4,200 Hz bandpass, say) may mask A
+too (reference: `encode_adaptive(..., tone_mask=...)`).
 
 - Mode B uses phase-1 values; mode C uses phase-2 values.
 - A tone is *excluded* if its SINR is below the floor
@@ -222,16 +265,10 @@ every mini-header (§8), so the receiver never recomputes it.
 - Never exclude more than 40%: if exclusions exceed 40% of
   the grid, keep the top 60% of tones by score
   `SINR_dB + 20·log10(max(rel_gain, 1e-3))` instead.
-- **Mode B impairment cap.** If the median phase-1 SINR is
-  below 25 dB, B additionally caps its active set at 47
-  tones, dropping the worst-scoring active tones. Rationale
-  (measured): at fixed peak normalization, per-tone
-  power falls as tone count grows; 77-tone B is ~2 dB short
-  of surviving flat 25 dB white noise (0/6 draws), while an
-  arbitrary 47-tone subset passed 3/3 — the cap buys the
-  power back at the cost of rate (450 → 339 B/s), and binds
-  only on channels measurably short of pristine (impaired
-  medians measured 0.3–15.1 dB; clean reads 104.8 dB).
+- *(Rev 8.1's "Mode B impairment cap" — B caps at 47 tones when
+  the median phase-1 SINR is under 25 dB — is removed. It
+  compensated for the ill-conditioned 8.1 detector; 77-tone B now
+  decodes flat 18 dB white noise 4/4, §14.2.)*
 
 Excluded tones' capacity is simply lost, never reassigned.
 
@@ -256,36 +293,50 @@ stream never spans segments or modes.
 
 ## 7. Payload sections
 
-Every payload section opens with a 6-symbol preamble at the
-section's own timing: absolute phases per tone k,
-rows 0–2 = φ[k], rows 3–5 = φ[k] + pat[k], where
-φ[k] = ((5k) mod 8)·π/4 and pat[k] = (k mod 8)·π/4
-(differences [0, 0, pattern, 0, 0]). Data symbols follow,
-differentially encoded per §2. The receiver drops the
-preamble-internal differences and decodes from the
-preamble's last row.
+Every payload section opens with a **single reference symbol**
+at the section's own timing: absolute phase on tone k of
+`π·k²/N` (Schroeder, §3; N = the session's active tone count).
+Data symbols follow, differentially encoded per §2: the first
+data symbol's step is measured against the reference symbol. (8.1
+spent six symbols on a pattern preamble; differential decoding
+needs one reference, and a low-crest one keeps the data scale up.)
+A section's length is known exactly from the mini-header (`seglen`,
+§8.1): the receiver projects exactly `1 + ⌈bits / bits-per-symbol⌉`
+slots.
 
 ### 7.1 RS modes (A and B): framing
 
-Framing, with an 'N8' magic:
+Framing, with an 'N8' magic (rev 8.2: *shortened, evenly split*
+blocks):
 
-1. Body = stored chunk ‖ CRC-32(stored), big-endian.
-2. Split the body into blocks of `blk_data` bytes (A: 239,
-   B: 191), zero-padding the last; RS-encode each to 255
-   bytes (A: 16 parity, B: 64 parity). RS is a
-   GF(2^8) code (primitive polynomial 0x11D,
-   generator roots α^0..α^(nsym−1)).
+1. Body = stored chunk ‖ CRC-32(stored), big-endian; let
+   `L = len(stored) + 4`.
+2. `nb = ⌈L / blk_data⌉` blocks (A: `blk_data` 239, 16 parity;
+   B: 223, 32 parity), each of `k = ⌈L / nb⌉` data bytes — the
+   body zero-padded at the end to `nb·k` bytes and cut into
+   equal blocks. Each block is RS-encoded to `k + nsym` bytes (a
+   *shortened* RS code: only those bytes are transmitted; the
+   padding zeros are part of the codeword and the decoder
+   verifies they decode as zeros). RS is a GF(2^8) code
+   (primitive polynomial 0x11D, generator roots α^0..α^(nsym−1)).
+   (8.1 always sent full 255-byte blocks: an 80-byte message cost
+   ~280 bytes of air.)
 3. Byte-interleave the blocks column-wise: stream byte
-   order is, for byte index i = 0..254, for each block b,
+   order is, for byte index i = 0..k+nsym−1, for each block b,
    block[b][i].
 4. Prepend an RS(25,9) header before every 400 stream
    bytes: header info (9 bytes) = 'N8' ‖ stored length
    (4 B BE) ‖ block count (2 B BE) ‖ flags (1 B; bit0 =
-   compressed). Header parity is 16 bytes.
+   compressed). Header parity is 16 bytes. A header is valid only
+   if its block count equals `⌈(stored length + 4) / blk_data⌉`,
+   its stored length is under 2^20, its flags use only bit 0, and
+   its stored length equals the mini-header's `seglen`.
 5. The section's bit stream is the framed bytes, MSB-first,
    mapped to per-tone Gray steps in row-major order (symbol
    by symbol, tone by tone, each tone's bits consecutive,
-   high bit first).
+   high bit first). The stream length is
+   `nb·(k+nsym) + 25·⌈nb·(k+nsym)/400⌉` bytes — a function of
+   the stored length alone.
 
 Decoding reverses this: headers are located by scanning at
 the 425-byte stride (and at any offset — headers repeat, so
@@ -305,9 +356,10 @@ info = flags(1 B) ‖ stored chunk ‖ CRC-32(flags ‖ stored) (4 B BE)
 ```
 
 where flags bit0 = compressed, as in §6. The mini-header's
-seglen field carries len(info) exactly (mode C sections are
-not self-delimiting; RS-mode seglen carries the raw chunk
-length instead, their framing being self-delimiting).
+seglen field carries len(info) exactly. (Rev 8.2: RS modes now
+also carry their *stored* length in `seglen` — 8.1 carried the raw
+chunk length there — so every section's length in samples is
+known from its mini-header.)
 
 Coding is a rate-⅓ convolutional code: constraint
 length 7, generator polynomials (octal) 171 / 165 / 133,
@@ -345,29 +397,42 @@ PENTA tones with the §7.2 convolutional codec.
 | Bytes | Field |
 |---|---|
 | 0–1 | magic 'N8' |
-| 2 | VERSION = 8 |
+| 2 | WIRE REVISION = 0x82 (rev 8.2) |
 | 3 | mode: 0=A, 1=B, 2=C |
 | 4–5 | session ID (BE) |
 | 6 | segment index |
 | 7 | segment total |
 | 8 | flags: bit0 FINAL, bit1 TOKEN-present, bits2–3 NEXT-SPEAKER |
 | 9–12 | seglen (BE; §7.2 for its mode-dependent meaning) |
-| 13–22 | tone mask, 10 bytes, MSB-first (bit i = grid tone i; mode A: all ones, ignored) |
+| 13–22 | tone mask, 10 bytes, MSB-first (bit i = grid tone i; **all modes**, rev 8.2) |
 | 23–28 | house token (6 bytes; zeros when absent) |
 | 29–30 | CRC-16 (BE) over bytes 0–28 |
 
 CRC-16 is CRC-16/CCITT-FALSE (a.k.a. CRC-HQX): polynomial
 0x1021, initial value 0xFFFF, no input reflection, no output
 reflection, no final XOR. A mini-header whose CRC fails, whose magic
-is wrong, whose VERSION is not 8, whose segment total is 0, or whose
-segment index is not below the segment total (rev 8.1: no sender
-produces these; a receiver that accepted them could be steered by a
-CRC-valid but nonsensical header) is invalid: the
-receiver treats the burst as not found (loudly), never
-guesses. The version byte is how a receiver knows what it
-is hearing; a house known to hold only an older profile is
-sent that profile — rollout is a directory matter, not a
-code matter.
+is wrong, whose mode byte is not 0–2, whose seglen is ≥ 2^20, whose
+segment total is 0, whose segment index is not below the segment
+total, whose flags set any of the reserved bits 4–7, or whose token
+bytes are non-zero without the TOKEN flag, is invalid: the
+receiver treats the burst as not found (loudly), never guesses
+(no sender produces these; a receiver that accepted them could be
+steered by a CRC-valid but nonsensical header).
+
+**Wire revision (rev 8.2).** Byte 2 names the wire format. The
+check order is: magic, CRC-16, *then* revision. A header that
+passes magic and CRC but carries a revision other than `0x82` is
+**not** invalid-and-ignored: the receiver raises a named error
+(reference: `RevisionError`, a `ValueError`, carrying `.rev` and
+`.expected`) from every decode entry point. 8.0/8.1 bursts carry 8
+here. Future incompatible revisions must change this byte and keep
+the magic / revision / CRC-16 positions. Honest scope: the named
+error needs the header to be *found*. An 8.1 Mode A burst is found
+(the 8.2 correlator still locks its sounding) and is reported with
+its revision; an 8.1 Mode C burst is not locked and fails as "no
+NDAP-8 burst found" — loud, never wrong bytes, but unnamed; and an
+8.1 decoder shown an 8.2 burst fails loudly the same way (8.1
+treats any byte-2 value other than 8 as "not a header").
 
 The **session ID** is a 16-bit random nonce, never
 intentionally repeated by a sender. It keeps simultaneous
@@ -462,7 +527,13 @@ direction's columns afterwards — projecting a half-grid
 alone lets the other direction's energy leak into the
 phases. Per-direction net rates are
 roughly half the simplex body rates (half the tones), less
-mini-header overhead: measured examples in §14.
+mini-header overhead: measured examples in §14. Duplex is carried
+over unchanged in structure and verified under 8.2 (A and B
+byte-exact both directions; Python ↔ JS cross-checked for B). Two
+rev 8.2 details apply to it: the sounding halves keep the
+Schroeder phases of their tone indices, and the receiver locates
+the mix with the full-sounding correlator (the sum of two halves
+*is* the full sounding).
 
 ## 12. Receiver flow, resync, and NACK
 
@@ -470,10 +541,10 @@ Reference receiver flow. The format is what is normative; the
 search is receiver-internal, except where marked **(strict)**,
 which every receiver must do:
 
-1. **Acquire by correlation (rev 8.1, primary).** The sounding
+1. **Acquire by correlation.** The sounding
    (§3) is a fixed, known waveform. Let `ref` be the sounding
    audio (the 9,600 samples a sender emits, peak-normalized
-   to 0.85), mean removed and scaled to unit norm, and `L` its
+   to 0.85; §3 — the rev 8.2 chirp-sign sounding), mean removed and scaled to unit norm, and `L` its
    length. For every offset `k` of the recording compute the
    normalized cross-correlation
 
@@ -492,29 +563,42 @@ which every receiver must do:
    the ladder absorbs skew from filtering, and step 2 refines.
    (Idea credited to NDAP-8-P, whose receiver acquires by
    normalized cross-correlation with an offset retry ladder;
-   here the template is NDAP-8's own sounding, so nothing on the
-   air changes.)
+   here the template is NDAP-8's own sounding. With the rev 8.2
+   sounding the peak is exact to the sample in clean recordings
+   and within a few samples through moderate noise.)
 2. **Refine the start.** Scan ±64 samples around the candidate
-   and keep the centre of the plateau over which segment 0's
-   *payload section* decodes exactly. (Cheaper refinements —
-   mini-header soft-score refinement, header-only plateau
-   checks, and the sounding correlation peak — were measured and
-   found unreliable.)
-3. **Fall back (rev 8.0 finder).** If step 1 finds no
-   mini-header, or the burst does not decode, a receiver may
-   repeat from the rev 8.0 search: energy-onset candidates,
-   ranked by correlation with the known phase-1 pattern and
-   validated by the mini-header. The reference decodes with the
-   correlation start first and tries the rev 8.0 start only if
-   it differs.
-4. **Walk the segments.** Each mini-header gives the next
-   section's exact length (§7, §8.1 seglen), so segment
-   boundaries chain deterministically. If a mini-header
+   — in steps of 4 samples for the unguarded Mode A (timing
+   plateau ≈ ±3 samples), steps of 16 for B and C (plateaus ≥ ±70)
+   — and keep the centre of the plateau over which segment 0's
+   *payload section* decodes exactly. For Mode A the centre is only
+   a coarse guess, so it is then replaced by the minimum of the
+   **alignment metric** (below) within ±8 samples, provided segment 0
+   still decodes there. (Cheaper refinements — mini-header
+   soft-score refinement, header-only plateau checks, and the
+   sounding correlation peak — were measured and found unreliable.)
+   *Alignment metric:* for a candidate section start, project the
+   first 64 data symbols (plus the reference symbol), take each
+   tone's differential phase, and average the squared distance to
+   the nearest constellation point. It needs no decode and has a
+   sharp minimum at the true alignment (measured on Mode A,
+   noiseless: 0.0000 at 0, 0.0016 at +1, 0.0047 at +2, 0.0150 at +4,
+   0.0210 at +5 samples).
+3. **(Rev 8.1's fall-back to the 8.0 energy-onset finder is removed
+   in 8.2: there is nothing left to be compatible with.)**
+4. **Walk the segments.** Each mini-header gives its section's
+   exact length (§7, §8.1 seglen), so segment boundaries chain
+   deterministically — *including past a failed section*: the
+   next mini-header is expected exactly after it (8.1 had to resync
+   after every failure). For an unguarded mode (A) each section's
+   start is first re-aligned by the alignment metric within ±8
+   samples, and the corrected position carries forward — this tracks
+   sample-clock drift between sections (§13). If a mini-header
    fails mid-burst, resync with a bounded scan (the
    reference uses a 4 s window) plus soft-score refinement;
    segments that cannot be recovered are reported failed,
-   not silently skipped.
-5. **Normalize the slow envelope (rev 8.1, retry).** If the raw
+   not silently skipped. A CRC-valid header of another wire
+   revision anywhere raises `RevisionError` (§8.1).
+5. **Normalize the slow envelope (retry).** If the raw
    walk does not fully decode, repeat it with the slow gain
    envelope divided out (informative algorithm below). Phone
    AGC, a tremolo, or a deliberate slow envelope multiply the
@@ -553,19 +637,34 @@ otherwise).
 
 ## 13. Clock drift
 
-Segments are ~2 s with per-segment re-synchronization
-(each mini-header is found and decoded at its own position,
-and section lengths chain from decoded headers), so the
-design tolerates device clock mismatch up to ~100 ppm
-(≈5 ms over a 50 s burst — inside the guard structure).
-Beyond ~100 ppm, expect late-burst segments to start
-drifting outside their refinement windows: failures appear
-as named failed segments, loudest in mode A (no guard).
-Sample-rate conversion, when needed, belongs in the
-recording path and must be reported with any real-air
-result (§16).
+Two different things go by this name. *Between* sections, Mode A
+re-aligns every section by the §12 alignment metric (±8 samples)
+and carries the correction forward, so drift accumulated over the
+burst is tracked as long as a single section stays inside its
+plateau. *Inside* a section nothing is tracked: Mode A's decode
+plateau is only ≈ ±3 samples (5 ms symbols, no guard), so a 1.2 s
+section tolerates roughly ±90 ppm of sample-clock mismatch.
+Measured (4,000 random bytes = 2 segments, Mode A, resampled by
+the stated ppm): **8.2 decodes at 0, +25, ±40, ±50, ±60, ±75, ±90
+and −100 ppm and fails at +100; 8.1 decodes at 0 and fails from
+25 ppm up.** Modes B
+and C have guards and plateaus ≥ ±70 samples and each section is
+re-located through its own mini-header. Beyond a mode's tolerance,
+failures appear as named failed segments, loudest in mode A.
+Sample-rate conversion, when needed, belongs in the recording path
+and must be reported with any real-air result (§16). (The 8.1 text
+claimed ~100 ppm for all modes; that figure was never measured for A.)
 
 ## 14. Test channels and measured results
+
+### 14.1 Simulated room channels (rev 8.0/8.1 measurements — NOT re-run for 8.2)
+
+**Status.** The table and notes in this subsection were measured with
+the rev 8.0/8.1 formats and the mode thresholds of that time. The
+channel generators behind them are not in the tree, so they were not
+re-run for 8.2; read them as history, not as 8.2 results. A coarse
+re-check with *rebuilt* echo channels is reported in §14.2 (not the
+original matrix).
 
 Channels are simulated by FFT convolution with
 energy-normalized impulse responses (diffuse tails with
@@ -618,7 +717,7 @@ treat C as best-effort-plus-NACK, or step down to the USE_NDAP6 profile.
 2.55 s = 196 B/s per direction. C: 105 B/direction (one
 segment) in 4.97 s = 21 B/s per direction. All byte-exact.
 
-**Sample.** The release tree's `examples/ndap8-sample.wav` is a pure encoded burst — no voice intro — carrying the “Mary Had a Little Lamb” verses as its payload, encoded by `encode_auto` on a clean sounding (mode A); it decodes byte-exact from the finished file.
+**Sample.** The release tree's `examples/ndap8-sample.wav` is a pure encoded burst — no voice intro — carrying the “Mary Had a Little Lamb” verses (233 bytes) as its payload, encoded for rev 8.2 by `encode_adaptive` with the clean-sounding analysis (mode A, session 11724; 0.86 s); it decodes byte-exact from the finished file. (The 8.0/8.1 sample was a foreign revision and was regenerated.)
 
 ## 15. Composition with parallel channels
 
@@ -660,10 +759,12 @@ designed behaviour.
 
 ## 17. Honest limits
 
-- Mode A is a clean-channel mode. Its sounding metric can
-  read optimistically on flat noise (§5); the 16 dB
-  threshold is calibrated on the channels measured here,
-  not on live air.
+- Mode A is a clean-channel mode, but a much less fragile one
+  than in 8.1: it decodes white noise down to ≈ 12 dB SNR
+  (§14.2) and tracks clock drift to ≈ ±90 ppm (§13). Its timing
+  plateau is only ≈ ±3 samples, its guard is zero, and its
+  echo tolerance on real air is unmeasured; the 22 dB
+  selection threshold is calibrated on white noise only (§5).
 - Mode C on the noisy-room channel is marginal (~half of
   draws fully pass; §14). A pair-FSK + rate-⅓ fallback
   (~25–30 B/s) is not part of this protocol; it is the
@@ -679,13 +780,14 @@ designed behaviour.
 - The house token authenticates origin to a secret-holder.
   It does not encrypt, and verbatim replay is a known
   residual risk (§10).
-- Correlation acquisition fixes *finding* the burst, not the
-  physical-layer floor. Through white Gaussian noise the
-  limits are the modes' own: A and B (denser constellations, RS
-  codes with little margin) still fail at 30 dB SNR even though
-  the start is found exactly; C, with its rate-⅓ code, keeps
-  decoding well below the levels where the rev 8.0 finder lost
-  the burst (§14, rev 8.1 table).
+- Correlation acquisition fixes *finding* the burst; the physical-layer
+  floor is the modes' own. Rev 8.2 lowered the A/B floor by
+  removing its cause (the ill-conditioned tapered detector and a
+  high-crest preamble, §2–§3), not by adding redundancy; the
+  measured floors are in §14.2: A ≈ 11–12 dB white-noise SNR,
+  B ≈ 6–9 dB, C ≈ 0 dB. These are floors for a *flat* noise
+  channel; rooms add echo and colored noise (§14.1) that 8.2 has
+  not been re-measured against.
 - The slow-envelope normalizer (§12 step 5) is a retry, and its
   measured rescue rate is small: once acquisition is by
   correlation, a 0.60–1.00 envelope at 25 Hz decodes raw in
@@ -693,12 +795,13 @@ designed behaviour.
   deep envelope removes, and in the guarded modes (B, C) it has
   only two to four sub-window measurements per slot, so envelopes
   faster than about 25 Hz are not tracked.
-- `analyze_channel` was not changed in 8.1. Fed a sounding that
-  had passed through a 250–4,200 Hz bandpass, it recommended
-  USE_NDAP6 and, for mode C, produced a tone mask lying above
-  3.4 kHz (the band the filter removed). Senders that know their
-  channel is band-limited should mask to the passband
-  themselves; this was observed, not investigated.
+- `analyze_channel` has not been re-examined for band-limited
+  channels. Under 8.1 a sounding that had passed through a
+  250–4,200 Hz bandpass was recommended USE_NDAP6 and, for mode C,
+  produced a tone mask above 3.4 kHz (the band the filter removed).
+  Senders that know their channel is band-limited should mask to the
+  passband themselves (every mode takes a mask in 8.2); the
+  analyzer's behaviour on such a sounding was not re-run for 8.2.
 - Nothing in this build has touched live air. Every number
   here is from the simulated harness; §16 exists because
   the first real recording will differ.
@@ -714,15 +817,15 @@ token, all-ones mask), `golden-<mode>.json` (payload text
 and SHA-256, the segment-0 mini-header info bytes, the
 first framed-stream/header bytes for RS modes or the info
 bytes and first 256 coded bits for mode C, and the
-post-projection constellation values of segment 0 rows 5
-and 6 for every tone), `corrupt-<mode>.wav` (the golden
+post-projection constellation values of segment 0 rows 0
+and 1 — the reference symbol and the first data symbol — for every tone), `corrupt-<mode>.wav` (the golden
 with an injected noise burst *inside* the mode's
 correction capacity — expected decode: EXACT), and
 `broken-<mode>.wav` (corrupted beyond capacity — expected:
 loud failure). Appendix B states the conformance criteria,
 including why the corrupt vectors exist.
 
-## 19. Expression Layer (optional, rev 8.1)
+## 19. Expression Layer (optional; introduced in 8.1, carried into 8.2)
 
 NDAP-8 bursts are not pleasant to hear, and people want to give
 them character. The rule that makes this safe is one sentence:
@@ -762,10 +865,9 @@ treated is not an NDAP-8 burst; receivers owe it nothing, and
 the reference implementation exposes no parameter that could
 produce one.
 
-**Receiver impact: none required.** An 8.0 receiver decodes an
-expression-wrapped burst (verified); an 8.1 receiver does too,
-because correlation acquisition (§12) finds the sounding
-wherever it is. A receiver may ignore everything outside the
+**Receiver impact: none required.** A rev 8.2 receiver decodes an
+expression-wrapped burst byte-exact in every mode (tested), because
+correlation acquisition (§12) finds the sounding wherever it is. A receiver may ignore everything outside the
 burst. A sender should not rely on listeners hearing the
 bookends: a recording path may trim silence.
 
@@ -811,7 +913,7 @@ the basis, and detection stays exact under the modulation.
 The technique is sound and is recorded here as a reserved
 option for a future profile that wants an audible signature.
 
-Rev 8.1 note: slow envelopes the sender did *not* announce (phone AGC,
+Rev 8.1/8.2 note: slow envelopes the sender did *not* announce (phone AGC,
 tremolo, a purr from another house) are handled blind by §12 step 5;
 this appendix is about announcing one so the receiver can fold it
 into the detector exactly.
@@ -831,19 +933,19 @@ An implementation is conformant when, for every mode:
    (SHA-256 given), and its intermediates match the JSON —
    mini-header info bytes, framing bytes (or mode C's info
    bytes and first coded bits), and the segment-0
-   constellation rows 5–6. The intermediates exist so a
+   constellation rows 0–1. The intermediates exist so a
    failure can be isolated to the PHY/projection layer vs
    the framing layer.
 2. `corrupt-<mode>.wav` still decodes EXACTLY. This file is
    the point of the set: an implementation that transmits
    parity but never decodes it — a decoder that never RS-decodes
    — passes criterion 1 and fails this one.
-   Measured correctable-burst sizes: A 26 samples, B 225
+   Measured correctable-burst sizes (rev 8.2): A 33 samples, B 300
    samples, C 7,920 samples of band-wide noise at section
    RMS, injected mid-section (exact placement in the JSON).
-   Mode A's small figure is itself a datum: RS(255,239)
-   over a 39-tone slot has little room for band-wide noise,
-   which is one more reason A is a clean-channel mode.
+   Mode A's small figure is itself a datum: one shortened
+   block with 16 parity bytes has little room for band-wide
+   noise, which is one more reason A is a clean-channel mode.
 3. `broken-<mode>.wav` fails LOUDLY (an error, or a report
    with ok = false and the failed segment indices).
    Producing wrong bytes is non-conformant under all

@@ -20,9 +20,10 @@
 
 export const SR = 48000;
 
-// Implementation/document revision (the on-air VERSION byte, 8, is a
-// separate wire-level constant and is unchanged).
-export const IMPL_VERSION = "8.1.0";
+// Implementation/document revision. The on-air revision byte (WIRE_REV,
+// see the mini-header) is a separate wire-level constant. 8.2 is a
+// clean-slate break: it neither decodes nor is decoded by 8.0/8.1.
+export const IMPL_VERSION = "8.2.0";
 
 // ------------------------------------------------------------ byte helpers
 function concatBytes(...parts) {
@@ -959,13 +960,14 @@ function percentile(a, q) {            // numpy linear interpolation
 // ------------------------------------------------------------ complex detector (least squares)
 // Detector rows = first N rows of pinv([B | conj(B)]) for the windowed
 // basis B (sym x N). Computed with the normal equations
-// (G = B2^H B2, Gauss-Jordan with partial pivoting); the detector
-// matrices' condition numbers are <= ~91, so the squared conditioning
-// (~8e3) leaves ~1e-12 relative error — measured in PORT-REPORT.md.
+// (G = B2^H B2, Gauss-Jordan with partial pivoting). Rev 8.2 projects A
+// and B with a rectangular window (condition number 1; 8.1's tapered
+// windows had 32 and 91), so the squared conditioning stays tiny; the
+// tapered C / mini / sounding-2 detectors are <= ~30.
 
-function _hann_tukey(sym) {
+function _hann_tukey(sym, taper = 0.25) {
   const win = new Float64Array(sym).fill(1);
-  const r = Math.trunc(0.25 * sym / 2);
+  const r = Math.trunc(taper * sym / 2);
   if (r > 0) {
     for (let i = 0; i < r; i++) win[i] = 0.5 - 0.5 * Math.cos(Math.PI * i / r);
     for (let i = 0; i < r; i++) win[sym - r + i] = win[r - 1 - i];
@@ -974,9 +976,9 @@ function _hann_tukey(sym) {
 }
 
 const _DET_CACHE = new Map();
-function _detector(sym, freqs, win, Ere, Eim) {
+function _detector(sym, freqs, win, Ere, Eim, taper = 0.25) {
   const N = freqs.length;
-  const key = `${sym}|${Array.from(freqs).join(",")}`;
+  const key = `${sym}|${taper}|${Array.from(freqs).join(",")}`;
   const hit = _DET_CACHE.get(key);
   if (hit) return hit;
   const M = 2 * N;
@@ -1067,8 +1069,9 @@ function _grid_freqs(lo, hi, step) {
 }
 
 export class Cfg {
-  constructor(name, freqs, gains, sym, bits = null) {
+  constructor(name, freqs, gains, sym, bits = null, taper = 0.25) {
     this.name = name;
+    this.taper = taper;
     this.freqs = Float64Array.from(freqs);
     this.gains = Float64Array.from(gains);
     this.sym = Math.trunc(sym);
@@ -1083,7 +1086,7 @@ export class Cfg {
   basis() {
     if (this._basis === null) {
       const N = this.ntones, sym = this.sym;
-      const win = _hann_tukey(sym);
+      const win = _hann_tukey(sym, this.taper);
       const Ere = new Float64Array(sym * N), Eim = new Float64Array(sym * N);
       for (let t = 0; t < sym; t++) {
         for (let k = 0; k < N; k++) {
@@ -1097,17 +1100,19 @@ export class Cfg {
   }
   detector() {
     const b = this.basis();
-    if (b.det === null) b.det = _detector(this.sym, this.freqs, b.win, b.Ere, b.Eim);
+    if (b.det === null) b.det = _detector(this.sym, this.freqs, b.win, b.Ere, b.Eim, this.taper);
     return b.det;
   }
   sub(idx) {
     idx = Array.from(idx);
     return new Cfg(`${this.name}[${idx.length}t]`, idx.map((i) => this.freqs[i]),
-                   idx.map((i) => this.gains[i]), this.sym, idx.map((i) => this.bits[i]));
+                   idx.map((i) => this.gains[i]), this.sym, idx.map((i) => this.bits[i]), this.taper);
   }
 }
 
-export const A_LAYOUT = new Cfg("grid200@5ms", _grid_freqs(400, 8000, 200), new Array(39).fill(1), 240);
+// Rev 8.2: rectangular detector window for the dense layouts (see ndap.py).
+export const A_LAYOUT = new Cfg("grid200@5ms", _grid_freqs(400, 8000, 200), new Array(39).fill(1), 240,
+                                null, 0.0);
 
 // ------------------------------------------------------------ layout machinery
 function _gray_tables(w) {
@@ -1118,16 +1123,20 @@ function _gray_tables(w) {
   return [g, inv];
 }
 
-export const PREAMBLE = 6;
+export const PREAMBLE = 1;
+
+// Schroeder phases: a flat-spectrum, low-crest multisine (see ndap.py).
+function _schroeder(n, sign = 1.0) {
+  const out = new Float64Array(n);
+  for (let k = 0; k < n; k++) out[k] = sign * Math.PI * k * k / Math.max(n, 1);
+  return out;
+}
 
 function _preamble_phases(cfg) {
   const N = cfg.ntones;
   const rows = new Float64Array(PREAMBLE * N);
-  for (let k = 0; k < N; k++) {
-    const phi = ((5 * k) % 8) * (Math.PI / 4);
-    const pat = (k % 8) * (Math.PI / 4);
-    for (let r = 0; r < PREAMBLE; r++) rows[r * N + k] = phi + (r >= 3 ? pat : 0);
-  }
+  const ph = _schroeder(N);
+  for (let r = 0; r < PREAMBLE; r++) rows.set(ph, r * N);
   return rows;
 }
 
@@ -1156,40 +1165,6 @@ function _values_to_stream(vals, cfg) {
   return packbits(bits);
 }
 
-const PREAMBLE_SYMS = PREAMBLE;
-
-function _onset_candidates(x, sym) {
-  const L = x.length;
-  const cs = new Float64Array(L + 1);
-  for (let i = 0; i < L; i++) cs[i + 1] = cs[i] + x[i] * x[i];
-  const step = Math.max(1, Math.floor(sym / 4));
-  const last = L - PREAMBLE * sym;
-  const span = PREAMBLE * sym;
-  const n = last >= 0 ? Math.floor(last / step) + 1 : 0;
-  if (n === 0) throw new Error("attempt to get argmax of an empty sequence");
-  const contrast = new Float64Array(n);
-  for (let i = 0; i < n; i++) {
-    const o = i * step;
-    const after = cs[Math.min(o + span, L)] - cs[o];
-    const before = cs[o] - cs[Math.max(o - span, 0)];
-    contrast[i] = (after - before) / (after + before + 1e-12);
-  }
-  const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => contrast[a] - contrast[b] || a - b).reverse();
-  const cands = [];
-  for (const idx of order) {
-    if (contrast[idx] <= 0) break;
-    const off = idx * step;
-    if (cands.every((c) => Math.abs(off - c) >= sym)) cands.push(off);
-    if (cands.length >= 12) break;
-  }
-  if (cands.length === 0) {
-    let bi = 0;
-    for (let i = 1; i < n; i++) if (contrast[i] > contrast[bi]) bi = i;
-    cands.push(bi * step);
-  }
-  return cands;
-}
-
 // ------------------------------------------------------------ tone sets
 export const GRID100 = Float64Array.from({ length: 77 }, (_, i) => 400.0 + 100.0 * i);
 export const GRID200 = Float64Array.from({ length: 39 }, (_, i) => 400.0 + 200.0 * i);
@@ -1198,23 +1173,23 @@ const A_TONE_IDX = Array.from(GRID200, (f) => roundHalfEven((f - 400) / 100));
 // ------------------------------------------------------------ modes (data)
 export const MODES = {
   A: { name: "A", grid: A_LAYOUT.freqs, gains: Array.from(A_LAYOUT.gains), active: A_LAYOUT.sym,
-       guard: 0, bits: 3, code: "rs", rs_data: 239, rs_nsym: 16, seg_cap: 3400 },
+       guard: 0, bits: 3, code: "rs", rs_data: 239, rs_nsym: 16, seg_cap: 3400, taper: 0.0, scan_step: 4 },
   B: { name: "B", grid: GRID100, gains: new Array(77).fill(1.0), active: 480, guard: 480,
-       bits: 2, code: "rs", rs_data: 191, rs_nsym: 64, seg_cap: 1050 },
+       bits: 2, code: "rs", rs_data: 223, rs_nsym: 32, seg_cap: 1200, taper: 0.0, scan_step: 16 },
   C: { name: "C", grid: GRID200, gains: new Array(39).fill(1.0), active: 960, guard: 480,
-       bits: 2, code: "conv", rs_data: 0, rs_nsym: 0, seg_cap: 105 },
+       bits: 2, code: "conv", rs_data: 0, rs_nsym: 0, seg_cap: 105, taper: 0.25, scan_step: 16 },
 };
 
 export function _sel_cfg(mc, mask, half = null) {
   const idx = half === null ? Array.from({ length: mc.grid.length }, (_, i) => i) : Array.from(half);
   const sel = idx.filter((i) => mask[i]);
   const cfg = new Cfg(`ndap8-${mc.name}`, sel.map((i) => mc.grid[i]), sel.map((i) => mc.gains[i]),
-                      mc.active, new Array(sel.length).fill(mc.bits));
+                      mc.active, new Array(sel.length).fill(mc.bits), mc.taper);
   return [cfg, sel];
 }
 
 function _full_cfg(mc) {
-  return new Cfg(`ndap8-${mc.name}-full`, mc.grid, mc.gains, mc.active, new Array(mc.grid.length).fill(mc.bits));
+  return new Cfg(`ndap8-${mc.name}-full`, mc.grid, mc.gains, mc.active, new Array(mc.grid.length).fill(mc.bits), mc.taper);
 }
 
 // ------------------------------------------------------------ sounding
@@ -1223,20 +1198,20 @@ const SND2_ACT = 960, SND2_GRD = 480, SND2_N = 4;
 const SND1_LEN = SND1_SYM * SND1_N;
 const SND2_LEN = (SND2_ACT + SND2_GRD) * SND2_N;
 export const SND_LEN = SND1_LEN + SND2_LEN;
-const _snd1_cfg = new Cfg("snd100", GRID100, new Array(77).fill(1), SND1_SYM, new Array(77).fill(0));
+const _snd1_cfg = new Cfg("snd100", GRID100, new Array(77).fill(1), SND1_SYM, new Array(77).fill(0), 0.0);
 const _snd2_cfg = new Cfg("snd200", GRID200, new Array(39).fill(1), SND2_ACT, new Array(39).fill(0));
 
-function _snd_phases(ntones, nrows) {
-  const phi = new Float64Array(nrows * ntones), pat = new Float64Array(ntones);
-  for (let k = 0; k < ntones; k++) {
-    const base = ((5 * k) % 8) * (Math.PI / 4);
-    pat[k] = (k % 8) * (Math.PI / 4);
-    for (let r = 0; r < nrows; r++) phi[r * ntones + k] = base + r * pat[k];
-  }
-  return { phi, pat };
+// Sounding chirp-sign sequences: each symbol is an up (+1) or down (-1)
+// Schroeder chirp (non-periodic signs -> one unambiguous correlation peak).
+const SND1_SIGNS = [1, 1, 1, -1, -1, 1, -1, 1];
+const SND2_SIGNS = [1, 1, -1, 1];
+function _snd_phases(ntones, signs) {
+  const phi = new Float64Array(signs.length * ntones);
+  signs.forEach((sg, r) => phi.set(_schroeder(ntones, sg), r * ntones));
+  return { phi };
 }
-const _snd1_phases = () => _snd_phases(77, SND1_N);
-const _snd2_phases = () => _snd_phases(39, SND2_N);
+const _snd1_phases = () => _snd_phases(77, SND1_SIGNS);
+const _snd2_phases = () => _snd_phases(39, SND2_SIGNS);
 
 // real(coeffs @ E.T) * win, for unit-magnitude coefficients exp(1j*phi)
 // on the tone subset idx (others zero).
@@ -1514,25 +1489,37 @@ function _modulate_bits_g(bits, cfg, guard, pre_n = PREAMBLE) {
 }
 
 // ------------------------------------------------- framing (one RS layer)
+// Rev 8.2: shortened, evenly split RS blocks (see ndap.py _rs_plan).
 const HDR_DATA = 9, HDR_NSYM = 16;
 const HDR_LEN = HDR_DATA + HDR_NSYM;
 const CHUNK = 400;
 const STRIDE = CHUNK + HDR_LEN;
 const FLAG_COMPRESSED = 0x01;
+const MAX_STORED = 1 << 20;
+
+export function _rs_plan(slen, blk_data) {
+  const total = slen + 4;
+  const nb = Math.ceil(total / blk_data);
+  return [nb, Math.ceil(total / nb)];
+}
+
+export function _rs_stream_len(slen, blk_data, blk_nsym) {
+  const [nb, k] = _rs_plan(slen, blk_data);
+  const body = nb * (k + blk_nsym);
+  return body + HDR_LEN * Math.ceil(body / CHUNK);
+}
 
 export function _frame_rs(stored, flags, blk_data, blk_nsym) {
   const crc = crc32(stored);
-  const body = concatBytes(stored, be32(crc));
+  const [nb, k] = _rs_plan(stored.length, blk_data);
+  const body = new Uint8Array(nb * k);
+  body.set(concatBytes(stored, be32(crc)));
   const blocks = [];
-  for (let i = 0; i < body.length; i += blk_data) {
-    const chunk = new Uint8Array(blk_data);
-    chunk.set(body.subarray(i, i + blk_data));
-    blocks.push(rs_encode(chunk, blk_nsym));
-  }
-  const nb = blocks.length;
-  const stream = new Uint8Array(255 * nb);
+  for (let i = 0; i < nb; i++) blocks.push(rs_encode(body.subarray(i * k, (i + 1) * k), blk_nsym));
+  const n = k + blk_nsym;
+  const stream = new Uint8Array(n * nb);
   let p = 0;
-  for (let i = 0; i < 255; i++) for (let b = 0; b < nb; b++) stream[p++] = blocks[b][i];
+  for (let i = 0; i < n; i++) for (let b = 0; b < nb; b++) stream[p++] = blocks[b][i];
   const hdr = concatBytes(Uint8Array.of(0x4e, 0x38), be32(stored.length), be16(nb), Uint8Array.of(flags));
   const hdr_enc = rs_encode(hdr, HDR_NSYM);
   const parts = [];
@@ -1540,43 +1527,46 @@ export function _frame_rs(stored, flags, blk_data, blk_nsym) {
   return concatBytes(...parts);
 }
 
-function _read_header_rs(stream, off) {
+function _read_header_rs(stream, off, blk_data) {
   let cand;
   try { cand = rs_decode(stream.subarray(off, off + HDR_LEN), HDR_NSYM); } catch (e) { return null; }
   if (cand.length === HDR_DATA && cand[0] === 0x4e && cand[1] === 0x38) {
     const slen = rd32(cand, 2), nb = rd16(cand, 6), flags = cand[8];
-    if (slen < 10_000_000 && nb > 0 && nb < 10000 && (flags & ~FLAG_COMPRESSED) === 0) return [slen, nb, flags];
+    if (slen < MAX_STORED && (flags & ~FLAG_COMPRESSED) === 0 && nb === _rs_plan(slen, blk_data)[0]) return [slen, nb, flags];
   }
   return null;
 }
 
-export function _unframe_rs(stream, blk_data, blk_nsym) {
+export function _unframe_rs(stream, blk_data, blk_nsym, expect_slen = null) {
   let hdr = null;
   for (let off = 0; off < Math.max(1, stream.length - HDR_LEN); off += STRIDE) {
-    hdr = _read_header_rs(stream, off);
+    hdr = _read_header_rs(stream, off, blk_data);
     if (hdr !== null) break;
   }
   if (hdr === null) throw new Error("payload header unrecoverable");
   const [slen, nb, flags] = hdr;
+  if (expect_slen !== null && slen !== expect_slen) throw new Error("payload header disagrees with the mini-header");
+  const k = _rs_plan(slen, blk_data)[1];
+  const n = k + blk_nsym;
   const parts = [];
   let have = 0, pos = 0;
-  while (pos + HDR_LEN <= stream.length && have < nb * 255) {
+  while (pos + HDR_LEN <= stream.length && have < nb * n) {
     pos += HDR_LEN;
     const piece = stream.subarray(pos, pos + CHUNK);
     parts.push(piece); have += piece.length;
     pos += CHUNK;
   }
-  const data = concatBytes(...parts).subarray(0, nb * 255);
-  if (data.length < nb * 255) throw new Error("payload stream truncated");
-  const blocks = Array.from({ length: nb }, () => new Uint8Array(255));
+  const data = concatBytes(...parts).subarray(0, nb * n);
+  if (data.length < nb * n) throw new Error("payload stream truncated");
+  const blocks = Array.from({ length: nb }, () => new Uint8Array(n));
   let idx = 0;
-  for (let i = 0; i < 255; i++) for (let b = 0; b < nb; b++) blocks[b][i] = data[idx++];
+  for (let i = 0; i < n; i++) for (let b = 0; b < nb; b++) blocks[b][i] = data[idx++];
   const bodyParts = blocks.map((blk) => rs_decode(blk, blk_nsym));
   const body = concatBytes(...bodyParts);
   const stored = body.slice(0, slen);
-  if (body.length < slen + 4) throw new Error("unpack requires a buffer of 4 bytes");
   const crc_stored = rd32(body, slen);
   if (crc32(stored) !== crc_stored) throw new Error("CRC-32 mismatch after RS decode");
+  for (let i = slen + 4; i < body.length; i++) if (body[i] !== 0) throw new Error("non-zero block padding after RS decode");
   return [stored, flags];
 }
 
@@ -1597,9 +1587,16 @@ export function _conv_info(chunk) {
   return concatBytes(info, be32(crc32(info)));
 }
 
+// The length the mini-header reports: the exact stored-byte count of the
+// section (rev 8.2), so every section's length is known from the header.
 export function _seg_stored_len(mc, chunk) {
   if (mc.code === "conv") return _conv_info(chunk).length;
-  return chunk.length;
+  return _stored_of(chunk)[0].length;
+}
+
+function _section_nbits(mc, seglen) {
+  if (mc.code === "rs") return 8 * _rs_stream_len(seglen, mc.rs_data, mc.rs_nsym);
+  return CODE_GENS.length * (seglen * 8 + 6);
 }
 
 export function _encode_section(mc, chunk, mask, sub_cfg = null) {
@@ -1627,17 +1624,19 @@ export function _decode_section(mc, samples, start, seglen, mask, chan = null) {
   let proj, col_idx, cfg;
   if (chan !== null) [proj, col_idx, cfg] = chan;
   else { cfg = _sel_cfg(mc, mask)[0]; proj = cfg; col_idx = null; }
+  const nbits = _section_nbits(mc, seglen);
+  const ndata = Math.ceil(nbits / cfg.bits_per_sym);
   if (mc.code === "rs") {
-    let coeffs = _slots_coeffs(samples, proj, mc.guard, start);
+    let coeffs = _slots_coeffs(samples, proj, mc.guard, start, PREAMBLE + ndata);
     if (col_idx !== null) coeffs = _cols(coeffs, col_idx);
     const vals = _values_from_coeffs(coeffs, cfg, PREAMBLE);
     const stream = _values_to_stream(vals, cfg);
-    const [stored, flags] = _unframe_rs(stream, mc.rs_data, mc.rs_nsym);
+    const [stored, flags] = _unframe_rs(stream, mc.rs_data, mc.rs_nsym, seglen);
     return _unstored_of(stored, flags);
   }
   const info_len = seglen;
-  const coded_len = CODE_GENS.length * (info_len * 8 + 6);
-  const nsym = PREAMBLE + Math.ceil(coded_len / cfg.bits_per_sym) + 2;
+  const coded_len = nbits;
+  const nsym = PREAMBLE + ndata + 2;
   let coeffs = _slots_coeffs(samples, proj, mc.guard, start, nsym);
   if (col_idx !== null) coeffs = _cols(coeffs, col_idx);
   const llrs = _qpsk_llrs(coeffs);
@@ -1652,19 +1651,54 @@ export function _decode_section(mc, samples, start, seglen, mask, chan = null) {
   return _unstored_of(body.subarray(1), body[0]);
 }
 
-export function _section_samples(mc, chunk, seglen, mask, chan = null) {
+const ALIGN_SYMS = 64;                 // data symbols the alignment metric uses
+const ALIGN_RADIUS = 8;                // per-section timing search, samples
+
+// Timing-alignment metric (mirrors ndap.py _align_error): mean squared
+// distance of the measured differential phases to their nearest
+// constellation points over a section's first ALIGN_SYMS data symbols.
+function _align_error(mc, samples, start, mask, chan = null) {
+  let proj, col_idx, cfg;
+  if (chan !== null) [proj, col_idx, cfg] = chan;
+  else { cfg = _sel_cfg(mc, mask)[0]; proj = cfg; col_idx = null; }
+  let co = _slots_coeffs(samples, proj, mc.guard, start, PREAMBLE + ALIGN_SYMS);
+  if (col_idx !== null) co = _cols(co, col_idx);
+  if (co.n < 3) return Infinity;
+  const dp = _dphi(co), N = co.ntones, nd = co.n - 1;
+  let sum = 0;
+  for (let r = 0; r < nd; r++) {
+    for (let k = 0; k < N; k++) {
+      const step = 2 * Math.PI / (1 << cfg.bits[k]);
+      const d = dp[r * N + k];
+      const e = d - roundHalfEven(d / step) * step;
+      sum += e * e;
+    }
+  }
+  return sum / (nd * N);
+}
+
+function _align_offset(mc, samples, start, mask, chan = null, radius = ALIGN_RADIUS) {
+  let best = null, best_d = 0;
+  const ds = [];
+  for (let d = -radius; d <= radius; d++) ds.push(d);
+  ds.sort((a, b) => Math.abs(a) - Math.abs(b) || a - b);   // stable by |d|; python sorted() keeps -d first
+  for (const d of ds) {
+    if (start + d < 0) continue;
+    const e = _align_error(mc, samples, start + d, mask, chan);
+    if (best === null || e < best - 1e-12) { best = e; best_d = d; }
+  }
+  return best_d;
+}
+
+export function _section_samples(mc, seglen, mask, chan = null) {
   const bps = chan !== null ? chan[2].bits_per_sym : _sel_cfg(mc, mask)[0].bits_per_sym;
-  let nbits;
-  if (mc.code === "rs") {
-    const [stored, flags] = _stored_of(chunk);
-    nbits = _frame_rs(stored, flags, mc.rs_data, mc.rs_nsym).length * 8;
-  } else nbits = CODE_GENS.length * (seglen * 8 + 6);
-  const nsyms = PREAMBLE + Math.ceil(nbits / bps);
+  const nsyms = PREAMBLE + Math.ceil(_section_nbits(mc, seglen) / bps);
   return nsyms * (mc.active + mc.guard);
 }
 
 // ------------------------------------------------------------ mini-header
-export const VERSION = 8;
+// Wire-format revision marker (rev 8.2): byte 2 of every mini-header.
+export const WIRE_REV = 0x82;
 export const MINI_INFO = 31;
 const MINI_GENS = CODE_GENS;
 const MINI_CODED_BITS = MINI_GENS.length * (MINI_INFO * 8 + 6);     // 762
@@ -1687,7 +1721,6 @@ function _mask_bytes(mask) {
 
 function _mask_from_bytes(mode, raw) {
   const n = { A: 39, B: 77, C: 39 }[mode];
-  if (mode === "A") return new Array(n).fill(1);
   return Array.from({ length: n }, (_, i) => ((raw[i >> 3] >> (7 - (i % 8))) & 1 ? 1 : 0));
 }
 
@@ -1706,11 +1739,21 @@ export function check_phrase(session, payload_crc32, secret, digits = 4) {
   return (n % 10n ** BigInt(digits)).toString().padStart(digits, "0");
 }
 
+// A CRC-valid header of another wire revision: loud, named, never a mis-decode.
+export class RevisionError extends Error {
+  constructor(rev, expected = WIRE_REV) {
+    super(`NDAP-8 wire revision 0x${rev.toString(16).padStart(2, "0")} is not supported by this decoder ` +
+          `(speaks 0x${expected.toString(16).padStart(2, "0")}, rev 8.2): format mismatch`);
+    this.name = "RevisionError";
+    this.rev = rev; this.expected = expected;
+  }
+}
+
 export function _mini_info_bytes(mode, session, idx, total, seglen, mask,
                                  final = false, token = null, next_speaker = 0) {
   const flags = (final ? FLAG_FINAL : 0) | (token ? FLAG_TOKEN : 0) | ((next_speaker & 0x03) << 2);
   const raw = concatBytes(
-    Uint8Array.of(0x4e, 0x38), Uint8Array.of(VERSION), Uint8Array.of({ A: 0, B: 1, C: 2 }[mode]),
+    Uint8Array.of(0x4e, 0x38), Uint8Array.of(WIRE_REV), Uint8Array.of({ A: 0, B: 1, C: 2 }[mode]),
     be16(session), Uint8Array.of(idx, total), Uint8Array.of(flags), be32(seglen),
     _mask_bytes(mask), token ? token : new Uint8Array(6));
   if (raw.length !== MINI_INFO - 2) throw new Error(`mini-header length ${raw.length}`);
@@ -1720,14 +1763,15 @@ export function _mini_info_bytes(mode, session, idx, total, seglen, mask,
 export function _mini_parse(raw) {
   if (raw.length !== MINI_INFO || raw[0] !== 0x4e || raw[1] !== 0x38) return null;
   if (rd16(raw, 29) !== _crc16(raw.subarray(0, 29))) return null;
-  if (raw[2] !== VERSION) return null;
+  if (raw[2] !== WIRE_REV) throw new RevisionError(raw[2]);
   const mode = { 0: "A", 1: "B", 2: "C" }[raw[3]];
   if (mode === undefined) return null;
   const seglen = rd32(raw, 9);
-  if (seglen >= 10_000_000) return null;
-  if (raw[7] === 0 || raw[6] >= raw[7]) return null;     // impossible index/count (rev 8.1)
+  if (seglen >= MAX_STORED) return null;
+  if (raw[7] === 0 || raw[6] >= raw[7]) return null;     // impossible index/count
   const flags = raw[8];
-  return { mode, version: raw[2], session: rd16(raw, 4), index: raw[6], total: raw[7], seglen,
+  if ((flags & 0xF0) || (!(flags & FLAG_TOKEN) && raw.subarray(23, 29).some((v) => v !== 0))) return null;
+  return { mode, version: raw[2], wire_rev: raw[2], session: rd16(raw, 4), index: raw[6], total: raw[7], seglen,
            flags, final: !!(flags & FLAG_FINAL), next_speaker: (flags >> 2) & 0x03,
            token: flags & FLAG_TOKEN ? raw.slice(23, 29) : null,
            mask: _mask_from_bytes(mode, raw.subarray(13, 23)) };
@@ -1834,9 +1878,9 @@ export function _analyze_at(samples, start, idx1 = null, idx2 = null) {
   return ana;
 }
 
-export const THR_P10 = { A: 16.0, B: -12.0, C: 5.0 };
-export const B_IMPAIRED_MEDIAN_DB = 25.0;
-export const B_IMPAIRED_MAX_TONES = 47;
+// Rev 8.2: A's and B's thresholds re-based on the orthogonal detector
+// (AWGN calibration; C carried over from 8.1 — see ndap.py THR_P10).
+export const THR_P10 = { A: 22.0, B: 18.0, C: 5.0 };
 
 export function recommend_mode(ana) {
   if (ana.A.p10_snr_db >= THR_P10.A) return "A";
@@ -1872,17 +1916,6 @@ export function mask_from_analysis(ana, mode) {
     for (const i of order.slice(order.length - k)) keep[i] = true;
     bad = keep.map((v) => !v);
   }
-  if (mode === "B") {
-    const finite = Array.from(snr).filter((v) => !Number.isNaN(v));
-    if (median(finite) < B_IMPAIRED_MEDIAN_DB) {
-      const active = bad.filter((b) => !b).length;
-      if (active > B_IMPAIRED_MAX_TONES) {
-        const order = argsort(score());
-        const act = order.filter((i) => !bad[i]);
-        for (const i of act.slice(0, active - B_IMPAIRED_MAX_TONES)) bad[i] = true;
-      }
-    }
-  }
   return bad.map((b) => (b ? 0 : 1));
 }
 
@@ -1912,55 +1945,13 @@ export function analyze_channel(samples) {
 }
 
 // ------------------------------------------------------------ finder
-export function _sounding_score(samples, off, idx1 = null) {
-  if (idx1 === null) idx1 = Array.from({ length: 77 }, (_, i) => i);
-  const co = _slots_coeffs(samples, _snd1_cfg, 0, off, SND1_N);
-  if (co.n < SND1_N) return -1.0;
-  const { pat } = _snd1_phases();
-  const N = co.ntones;
-  let sum = 0, cnt = 0;
-  const prevPh = new Float64Array(idx1.length);
-  idx1.forEach((k, a) => { prevPh[a] = Math.atan2(co.im[k], co.re[k]); });
-  for (let r = 1; r < SND1_N; r++) {
-    idx1.forEach((k, a) => {
-      const ph = Math.atan2(co.im[r * N + k], co.re[r * N + k]);
-      const d = ph - prevPh[a];
-      const dphi = Math.atan2(Math.sin(d), Math.cos(d));
-      sum += Math.cos(dphi - pat[k]); cnt++;
-      prevPh[a] = ph;
-    });
-  }
-  return sum / cnt;
-}
-
-export function _refined_candidates(samples, idx1 = null) {
-  const x = samples;
-  if (x.length < SND_LEN + MINI_LEN) return [0];
-  const cands = _onset_candidates(x, SND1_SYM);
-  const scored = [];
-  for (const cand of cands) {
-    const lo = Math.max(0, cand - SND1_SYM);
-    const hi = Math.min(x.length - SND1_LEN, cand + SND1_SYM);
-    if (hi < lo) continue;
-    let loc_off = cand, loc_sc = -2.0;
-    for (let off = lo; off <= hi; off += 8) {
-      const sc = _sounding_score(x, off, idx1);
-      if (sc > loc_sc) { loc_sc = sc; loc_off = off; }
-    }
-    for (let off = Math.max(lo, loc_off - 8); off <= Math.min(hi, loc_off + 8); off++) {
-      const sc = _sounding_score(x, off, idx1);
-      if (sc > loc_sc) { loc_sc = sc; loc_off = off; }
-    }
-    scored.push([loc_sc, loc_off]);
-  }
-  scored.sort((a, b) => b[0] - a[0] || b[1] - a[1]);
-  const out = [];
-  for (const [, off] of scored) if (out.every((o) => Math.abs(off - o) >= SND1_SYM)) out.push(off);
-  return out.length ? out : [0];
-}
-
+// Start of the sounding: the strongest normalized cross-correlation peak
+// (needs no mini-header after it). Throws when no peak clears the noise
+// floor — analyze_channel turns that into the degenerate analysis.
 export function _find_sounding_offset(samples, idx1 = null) {
-  return _refined_candidates(samples, idx1)[0];
+  const peaks = _ncc_peaks(samples, 1, 0);
+  if (!peaks.length) throw new Error("no sounding found in the recording");
+  return peaks[0][1];
 }
 
 function _seg0_check(x, sec_start, mini, chan = null) {
@@ -1975,13 +1966,23 @@ function _seg0_check(x, sec_start, mini, chan = null) {
 function _refine_start_checked(x, off, mini, mini_cfg, full_cfg = null, col_idx = null, chan = null) {
   const mini_len = _mini_len(mini_cfg);
   const good = [];
-  for (let delta = -64; delta < 65; delta += 4) {
+  // A's timing plateau is only ~+-5 samples wide: scanned in steps of 4;
+  // the guarded modes' plateaus are >= +-60 samples: steps of 16.
+  const step = MODES[mini.mode].scan_step;
+  for (let delta = -64; delta < 65; delta += step) {
     const cand = off + delta;
     if (cand < 0) continue;
     if (_seg0_check(x, cand + SND_LEN + mini_len, mini, chan)) good.push(delta);
   }
   if (!good.length) return [off, mini, false];
-  const delta = good[Math.floor(good.length / 2)];
+  let delta = good[Math.floor(good.length / 2)];
+  if (MODES[mini.mode].guard === 0) {
+    // unguarded mode (A): the plateau is only a few samples wide — take the
+    // alignment metric's minimum around its centre if segment 0 still decodes.
+    const sec0 = off + delta + SND_LEN + mini_len;
+    const d2 = _align_offset(MODES[mini.mode], x, sec0, mini.mask, chan);
+    if (d2 && _seg0_check(x, sec0 + d2, mini, chan)) delta += d2;
+  }
   if (delta === 0) return [off, mini, true];
   const m2 = _mini_decode(x, off + delta + SND_LEN, mini_cfg, full_cfg, col_idx);
   if (m2 === null || m2.index !== 0) return [off, mini, true];
@@ -1990,15 +1991,6 @@ function _refine_start_checked(x, off, mini, mini_cfg, full_cfg = null, col_idx 
 
 function _refine_start(x, off, mini, mini_cfg, full_cfg = null, col_idx = null, chan = null) {
   return _refine_start_checked(x, off, mini, mini_cfg, full_cfg, col_idx, chan).slice(0, 2);
-}
-
-function _find_burst_legacy(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null) {
-  const x = samples;
-  for (const off of _refined_candidates(x)) {
-    const mini = _mini_decode(x, off + SND_LEN, mini_cfg, full_cfg, col_idx);
-    if (mini !== null && mini.index === 0) return _refine_start(x, off, mini, mini_cfg, full_cfg, col_idx);
-  }
-  throw new Error("no NDAP-8 burst found (mini-header unrecoverable)");
 }
 
 // --- correlation acquisition (NDAP-8 rev 8.1) -------------------------
@@ -2050,10 +2042,11 @@ function _fft(re, im, inverse) {
   if (inverse) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
 }
 
-export function _ncc_peaks(samples, n_peaks = ACQ_PEAKS) {
+export function _ncc_peaks(samples, n_peaks = ACQ_PEAKS, tail = null) {
   const x = samples, ref = _snd_reference(), L = ref.length;
-  if (x.length < L + MINI_LEN) return [];
-  const last = x.length - L - MINI_LEN;
+  if (tail === null) tail = MINI_LEN;
+  if (x.length < L + tail) return [];
+  const last = x.length - L - tail;
   if (last < 0) return [];
   let n = 1;
   while (n < x.length + L) n <<= 1;
@@ -2108,11 +2101,10 @@ function _find_burst_xcorr(samples, mini_cfg = _mini_cfg, full_cfg = null, col_i
   throw new Error("no NDAP-8 burst found (correlation acquisition)");
 }
 
-function _find_burst(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null, method = "auto") {
-  if (method === "legacy") return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx);
-  try { return _find_burst_xcorr(samples, mini_cfg, full_cfg, col_idx); }
-  catch (e) { if (method === "xcorr") throw e; }
-  return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx);
+// Returns [start, mini] for segment 0 by correlation acquisition. Fails
+// loudly (Error; RevisionError for a foreign wire revision).
+function _find_burst(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null) {
+  return _find_burst_xcorr(samples, mini_cfg, full_cfg, col_idx);
 }
 
 // ------------------------------------------------------------ segmentation
@@ -2176,15 +2168,21 @@ function _walk_segments(x, start, mini0, mini_cfg = _mini_cfg, full_cfg = null, 
       break;
     }
     if (mini.index === total - 1 && mini.final) final_seen = true;
-    const sec_start = off + mini_len;
+    let sec_start = off + mini_len;
+    if (mc.guard === 0) sec_start += _align_offset(mc, x, sec_start, mask, chan);   // drift tracking
     try {
       const chunk = _decode_section(mc, x, sec_start, mini.seglen, mask, chan);
       segments.push({ index: idx, ok: true, error: null });
       chunks.set(idx, chunk);
-      off = sec_start + _section_samples(mc, chunk, mini.seglen, mask, chan);
+      off = sec_start + _section_samples(mc, mini.seglen, mask, chan);
     } catch (e) {
+      if (e instanceof RevisionError) throw e;
       segments.push({ index: idx, ok: false, error: `${e.name}: ${e.message}` });
-      idx += 1; mini = null; off = sec_start;
+      // rev 8.2: the section length is known from the validated mini-header,
+      // so the chain survives a failed section.
+      off = sec_start + _section_samples(mc, mini.seglen, mask, chan);
+      idx += 1;
+      mini = idx < total ? _mini_decode(x, off, mini_cfg, full_cfg, col_idx) : null;
       continue;
     }
     idx += 1;
@@ -2213,13 +2211,19 @@ function randomSession() {
   return (b[0] << 8) | b[1];
 }
 
-// opts: { analysis, session_id, house_secret, next_speaker }
+// opts: { analysis, session_id, house_secret, next_speaker, tone_mask }
 export function encode_adaptive(data, mode, opts = {}) {
-  const { analysis = null, house_secret = null, next_speaker = 0 } = opts;
+  const { analysis = null, house_secret = null, next_speaker = 0, tone_mask = null } = opts;
   let { session_id = null } = opts;
   if (!(mode in MODES)) throw new Error(`unknown mode '${mode}'`);
   const mc = MODES[mode];
-  const mask = analysis !== null ? mask_from_analysis(analysis, mode) : new Array(mc.grid.length).fill(1);
+  let mask;
+  if (tone_mask !== null) {
+    mask = Array.from(tone_mask, (m) => (m ? 1 : 0));
+    if (mask.length !== mc.grid.length || !mask.some((m) => m)) {
+      throw new Error("tone_mask must cover the mode's grid and keep at least one tone");
+    }
+  } else mask = analysis !== null ? mask_from_analysis(analysis, mode) : new Array(mc.grid.length).fill(1);
   if (session_id === null) session_id = randomSession();
   const token = house_secret !== null ? house_token(session_id, crc32(data), house_secret) : null;
   const chunks = _split_work(data, mc);
@@ -2261,31 +2265,22 @@ function _decode_attempt(x, start, norm) {
   } finally { _ENV.on = prev; }
 }
 
-// Receiver flow (rev 8.1), every step CRC-gated, first full success wins:
-// correlation acquisition raw, same start envelope-normalized, then the
-// 8.0 finder's start (if different) raw and normalized. If nothing fully
-// decodes, the attempt with the most good segments is reported (ok=false).
+// Receiver flow (rev 8.2), every step CRC-gated, first full success wins:
+// (1) correlation acquisition, raw samples; (2) the same start with the
+// slow envelope divided out. If nothing fully decodes, the attempt with the
+// most good segments is reported (ok=false). A CRC-valid header of another
+// wire revision throws RevisionError.
 export function decode_adaptive_report(samples, start = null, house_secret = null) {
   const x = samples instanceof Float64Array ? samples : Float64Array.from(samples);
-  const methods = start === null ? ["xcorr", "legacy"] : [null];
   let best = null, first_err = null;
-  const seen = new Set();
-  for (const method of methods) {
-    let st;
-    try { st = method === null ? start : _find_burst(x, _mini_cfg, null, null, method)[0]; }
-    catch (e) { first_err = first_err || e; continue; }
-    for (const norm of [false, true]) {
-      const key = `${st}/${norm}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      let rep;
-      try { rep = _decode_attempt(x, st, norm); }
-      catch (e) { first_err = first_err || e; continue; }
-      rep.acquisition = method || "given";
-      if (rep.ok) { best = rep; break; }
-      if (best === null || rep.ok_segments.length > best.ok_segments.length) best = rep;
-    }
-    if (best !== null && best.ok) break;
+  const st = start !== null ? start : _find_burst(x)[0];
+  for (const norm of [false, true]) {
+    let rep;
+    try { rep = _decode_attempt(x, st, norm); }
+    catch (e) { if (e instanceof RevisionError) throw e; first_err = first_err || e; continue; }
+    rep.acquisition = start !== null ? "given" : "xcorr";
+    if (rep.ok) { best = rep; break; }
+    if (best === null || rep.ok_segments.length > best.ok_segments.length) best = rep;
   }
   if (best === null) throw first_err;
   const rep = best;

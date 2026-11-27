@@ -6,7 +6,8 @@ platform imports. It runs unchanged in browsers, Cloudflare
 Workers and Node.js (developed and verified on Node 24).
 
 It is byte-compatible with the Python implementation at the
-repository root: the two implementations encode and decode each
+repository root (rev 8.2, wire revision `0x82` — a clean-slate
+format: neither implementation reads 8.0/8.1 bursts): the two implementations encode and decode each
 other's output exactly, including simultaneous two-direction
 (duplex) bursts, and encoded WAV files are sample-identical.
 
@@ -17,7 +18,7 @@ From this directory, with the Python reference available
 
     npm test
 
-runs three suites:
+runs four suites:
 
 - `test/conformance.mjs` — the golden, correctable-burst and
   beyond-capacity vectors from `../conformance/` decode exactly
@@ -30,7 +31,17 @@ runs three suites:
   chunk.
 - `test/crosscheck.mjs` — 60 cross-implementation checks against
   the Python reference, both directions, all three modes, plus
-  analyzer parity.
+  analyzer parity. Run `node test/crosscheck.mjs --quick` for the
+  reduced matrix.
+- `test/rev82.mjs` — rev 8.2 proofs against the Python reference:
+  Expression Layer parity, AWGN / envelope / clock-drift decodes of
+  Python-built stressed WAVs (agreement on start, acquisition and
+  normalization), the wire-revision marker (`RevisionError`), the
+  tone mask on every mode, and strict mini-header validation.
+
+(The 8.1 interoperability check against the Ear's embedded 8.0
+codec was removed with 8.0 compatibility; the Ear is being rebuilt
+on 8.2.)
 
 ## Notes
 

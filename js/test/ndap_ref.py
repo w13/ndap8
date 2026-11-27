@@ -12,6 +12,8 @@ JS cross-check. The reference is imported read-only; run with
   ndap_ref.py <ndap-dir> express <mode> <payload> <out.wav> <session>
   ndap_ref.py <ndap-dir> stress  <kind> <mode> <payload> <out.wav> <session>
   ndap_ref.py <ndap-dir> info    <in.wav>
+  ndap_ref.py <ndap-dir> foreign <mode> <payload> <out.wav> <session> <rev>   (rev 8.2)
+  ndap_ref.py <ndap-dir> maskenc <mode> <payload> <out.wav> <session> <hi_hz> (rev 8.2)
 Each prints one JSON line.
 """
 import sys, json
@@ -46,7 +48,7 @@ def main():
             print(json.dumps({"ok": True}))
         except ndap.SegmentError as e:
             print(json.dumps({"ok": False, "error": str(e), "failed": e.failed}))
-    elif cmd == "express":      # rev 8.1: encode + Expression Layer
+    elif cmd == "express":      # encode + Expression Layer
         data = open(a[1], "rb").read()
         burst = ndap.encode_adaptive(data, a[0], session_id=int(a[3]))
         ndap.write_wav(a[2], ndap.add_expression(burst))
@@ -60,11 +62,31 @@ def main():
         if kind in ("env", "env-awgn"):    # 25 Hz gain envelope, 0.60-1.00
             t = np.arange(len(y)) / ndap.SR
             y = y * (0.8 + 0.2 * np.sin(2 * np.pi * 25.0 * t + 0.7))
+        if kind == "drift":                # rev 8.2: sample-clock mismatch, ppm in a[5]
+            t = np.arange(len(y))
+            y = np.interp(t * (1 + float(a[5]) * 1e-6), t, y)
         if kind in ("awgn", "env-awgn"):   # white Gaussian noise, SNR vs burst power
             snr = float(a[5])
             p = np.mean(y[np.abs(y) > 0] ** 2)
             y = y + rng.normal(0, np.sqrt(p / 10 ** (snr / 10)), len(y))
         ndap.write_wav(a[3], y / max(1.0, float(np.max(np.abs(y)))))
+        print(json.dumps({"ok": True}))
+    elif cmd == "foreign":      # rev 8.2: a burst announcing another wire revision
+        data = open(a[1], "rb").read()
+        real = ndap.WIRE_REV
+        ndap.WIRE_REV = int(a[4])
+        try:
+            burst = ndap.encode_adaptive(data, a[0], session_id=int(a[3]))
+        finally:
+            ndap.WIRE_REV = real
+        ndap.write_wav(a[2], np.concatenate([np.zeros(14400), burst, np.zeros(9600)]))
+        print(json.dumps({"ok": True}))
+    elif cmd == "maskenc":      # rev 8.2: sender masks tones above hi_hz (any mode)
+        data = open(a[1], "rb").read()
+        mc = ndap.MODES[a[0]]
+        mask = [1 if f <= float(a[4]) else 0 for f in mc.grid]
+        ndap.write_wav(a[2], ndap.encode_adaptive(data, a[0], session_id=int(a[3]),
+                                                  tone_mask=mask))
         print(json.dumps({"ok": True}))
     elif cmd == "info":
         rep = ndap.decode_adaptive_report(ndap.read_wav(a[0]))

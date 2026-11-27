@@ -7,7 +7,7 @@ implementation is conformant when, for every mode:
   `golden-<mode>.json` (sha256 given), and its intermediate
   values match the JSON (mini-header info bytes, framing
   bytes, and the post-projection constellation of segment 0,
-  rows 5 and 6) — the intermediates exist so a failure can be
+  rows 0 and 1) — the intermediates exist so a failure can be
   isolated to the PHY/projection layer vs the framing layer.
 - `corrupt-<mode>.wav` — the golden with an error burst
   injected INSIDE the mode's correction capacity — still

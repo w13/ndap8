@@ -28,9 +28,9 @@ function constellation(audio, mode) {
   const mc = N.MODES[mode];
   const [cfg] = N._sel_cfg(mc, new Array(mc.grid.length).fill(1));
   const sec = N.SND_LEN + N.MINI_LEN;
-  const co = N._slots_coeffs(audio, cfg, mc.guard, sec, 7);
+  const co = N._slots_coeffs(audio, cfg, mc.guard, sec, 2);
   const rows = {};
-  for (const r of [5, 6]) {
+  for (const r of [0, 1]) {
     rows[`row${r}`] = Array.from({ length: co.ntones }, (_, k) => [co.re[r * co.ntones + k], co.im[r * co.ntones + k]]);
   }
   return rows;
@@ -38,7 +38,7 @@ function constellation(audio, mode) {
 
 function maxDev(got, want) {
   let m = 0;
-  for (const row of ['row5', 'row6']) {
+  for (const row of ['row0', 'row1']) {
     got[row].forEach((z, k) => { m = Math.max(m, Math.abs(z[0] - want[row][k][0]), Math.abs(z[1] - want[row][k][1])); });
   }
   return m;
@@ -81,14 +81,14 @@ for (const mode of MODES) {
     check(Array.from(coded.subarray(0, 256)).join('') === J.segment0_coded_bits_first256, 'first 256 coded bits');
   }
 
-  // 3. PHY intermediates: constellation rows 5-6, from (a) the JS encoder's
+  // 3. PHY intermediates: constellation rows 0-1, from (a) the JS encoder's
   //    float audio and (b) the golden WAV.
   const enc = N.encode_adaptive(payload, mode, { session_id: J.session_id });
   const devF = maxDev(constellation(enc, mode), J.constellation_segment0);
   const devW = maxDev(constellation(golden, mode), J.constellation_segment0);
   S.dev_float = devF; S.dev_wav = devW;
-  check(devF <= TOL_FLOAT, 'constellation rows 5-6 vs JSON (JS-encoded float audio)', `max |dev| = ${devF.toExponential(3)} (tol ${TOL_FLOAT})`);
-  check(devW <= TOL_WAV, 'constellation rows 5-6 vs JSON (golden WAV samples)', `max |dev| = ${devW.toExponential(3)} (tol ${TOL_WAV})`);
+  check(devF <= TOL_FLOAT, 'constellation rows 0-1 vs JSON (JS-encoded float audio)', `max |dev| = ${devF.toExponential(3)} (tol ${TOL_FLOAT})`);
+  check(devW <= TOL_WAV, 'constellation rows 0-1 vs JSON (golden WAV samples)', `max |dev| = ${devW.toExponential(3)} (tol ${TOL_WAV})`);
 
   // 4. encoder parity with the golden WAV (sample-level)
   const reEnc = N.read_wav(N.write_wav(enc));

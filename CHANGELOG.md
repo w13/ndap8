@@ -1,5 +1,104 @@
 # Changelog
 
+## 8.2.0 — 2026-11-27
+
+**On-air format: a clean-slate break.** The wire format changed freely:
+8.2 does not decode 8.0/8.1 bursts and 8.0/8.1 do not decode 8.2 bursts.
+Backward compatibility was dropped on purpose — NDAP is being developed
+for the first time and nothing deployed depends on the old format. The
+mini-header's byte 2 is now a *wire revision* marker, `WIRE_REV = 0x82`:
+a decoder that meets a CRC-valid header announcing another revision
+raises a named error (`RevisionError`) instead of guessing at the
+payload. Implementation revision is `ndap.__version__ == "8.2.0"`
+(`IMPL_VERSION` in JS); SPEC.md is "version 8 (revision 8.2)".
+
+### The headline fix — orthogonal detector windows
+
+Modes A and B space their tones at exactly 1/T, which is orthogonal
+only under a rectangular window. The 8.1 Tukey taper (τ = 0.25) broke
+that orthogonality: the augmented detector's condition number was 32
+(A) and 91 (B), amplifying noise by roughly 10 dB and 17 dB — the whole
+of the 8.1 A/B noise floor. Rev 8.2 sets **τ = 0 (rectangular) for
+Mode A, Mode B and sounding phase 1**; the rectangular detector's
+condition number is 1.0. Mode C (cond 1.15 under its taper), the
+mini-header and sounding phase 2 keep τ = 0.25.
+
+### What else changed on the air
+
+- Low-crest Schroeder-phase preamble and chirp-sign sounding.
+- A one-symbol payload preamble; shortened Reed-Solomon blocks sized
+  to the message; every section's exact stored length carried in the
+  mini-header; RS(255,223) for Mode B; the tone mask now applies to
+  every mode, A included.
+
+### Receiver
+
+- Correlation acquisition is the only finder — the 8.0 onset/sounding
+  fallback is gone. The 8.1 envelope normalization and retry ladder
+  are kept.
+- Per-section timing re-alignment for Mode A, and a decode chain that
+  survives a failed section and reports it by name.
+- Kept from earlier revisions: the §19 Expression Layer and §11
+  duplex, both re-verified. JS parity is kept (`js/src/ndap.js`,
+  `IMPL_VERSION "8.2.0"`).
+- Removed with the clean slate: the legacy 8.0 fixtures,
+  `tests/test_rev81.py` and `js/test/rev81.mjs`. Added:
+  `tests/test_rev82.py`, `js/test/rev82.mjs`, and
+  `tests/noise_trials.py` (the harness behind the tables below).
+
+### Measured — noise trials
+
+`tests/noise_trials.py`, 4 trials per cell, byte-exact decode, 0.3 s
+lead-in; 8.1 loaded from git `48c0756`, 8.2 from this tree. Default
+payload: 80 B of incompressible random data (zlib cannot flatter it).
+
+AWGN sweep, default payload:
+
+| Mode | SNR (dB) | 8.1 | 8.2 |
+|---|---|---|---|
+| C | 30 → 3 | 4/4 at every step | 4/4 at every step |
+| B | 30 | 0/4 | 4/4 |
+| B | 24 | 0/4 | 4/4 |
+| B | 18 | 0/4 | 4/4 |
+| B | 12 | 0/4 | 4/4 |
+| B | 6 | 0/4 | 4/4 |
+| B | 3 | 0/4 | 0/4 |
+| A | 30 | 0/4 | 4/4 |
+| A | 24 | 0/4 | 4/4 |
+| A | 18 | 0/4 | 4/4 |
+| A | 12 | 0/4 | 2/4 |
+| A | 6 | 0/4 | 0/4 |
+| A | 3 | 0/4 | 0/4 |
+
+Bandpass 250–4200 Hz: C 4/4 and B 4/4 under both revisions; A 4/4
+under 8.2 (not applicable to 8.1 in this harness). 25 Hz gain
+envelope: 4/4 in every mode under both revisions.
+
+Second run with the 8.1 suite's own 75 B English text payload tells
+the same story: 8.2 Mode B 4/4 at 30/24/18/12 dB and 2/4 at 6 dB;
+Mode A 4/4 at 30/24/18 dB and 2/4 at 12 dB; Mode C 4/4 throughout;
+8.1 again 0/4 in AWGN for A and B at every SNR.
+
+Effective speed (whole burst, 3000 B payload; payload-section-only
+rate in parentheses): A 1485 → **1531** B/s (2386 → 2537);
+B 421 → **508** B/s (577 → 759); C 58 → **63** B/s (85 → 97).
+
+**Read the 8.1 column with care.** Under this harness 8.1 fails AWGN
+outright in modes A and B under *both* payloads — worse than the
+figures published in the 8.1.0 entry, which were measured with the
+older trial code. The harness changed with 8.2; these tables are a
+same-harness, same-conditions comparison between the two revisions,
+not a revision of the 8.1 record. The within-harness verdict is
+unambiguous: at every AWGN operating point that matters, 8.2 decodes
+where 8.1 does not, and Mode C — the fails-loudly fallback — is
+unchanged.
+
+### Verification
+
+Python suite 51/51 passed. JS suite fully passed (conformance,
+zlib-exactness, crosscheck, rev82 40/40). Conformance regeneration is
+deterministic: identical tree hash across two runs.
+
 ## 8.1.0 — 2026-11-27
 
 **On-air format: unchanged.** The wire `VERSION` byte stays 8. Every

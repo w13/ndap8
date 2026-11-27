@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """NDAP — Narrowband Data-over-Audio Protocol: the consolidated
-final implementation (protocol version 8, the adaptive profile).
+final implementation (protocol version 8, the adaptive profile,
+implementation revision 8.2 — a clean-slate wire format; it neither
+decodes nor is decoded by 8.0/8.1, and says so loudly: see
+RevisionError).
 
 This single module is the whole NDAP-8 reference implementation
 — no other imports from the project, nothing to keep in step.
@@ -25,7 +28,8 @@ Architecture (one pipeline, modes as data):
   CRC layer, and the augmented [B|conj(B)] projection
   detector — each exists exactly once, in this file.
 - SOUNDING (0.2 s): phase 1 = 8 symbols x 10 ms on the 77-tone
-  100 Hz grid (400-8000 Hz), known phase pattern, no guard —
+  100 Hz grid (400-8000 Hz), known phase pattern, no guard,
+  rectangular window (rev 8.2) —
   the findable preamble and the A/B channel probe. Phase 2 =
   4 symbols at Mode C's own timing (20 ms + 10 ms guard) on
   the 39-tone 200 Hz grid — the C probe. analyze_channel() is
@@ -44,7 +48,8 @@ Architecture (one pipeline, modes as data):
   backchannel. Compression is per segment and resets with
   the mode: a zlib stream never spans segments or modes.
 - MINI-HEADER (0.575 s simplex): 31 info bytes — magic 'N8',
-  VERSION byte, mode, 16-bit random SESSION ID (a
+  wire-REVISION byte (0x82; any other value on a CRC-valid header
+  raises RevisionError), mode, 16-bit random SESSION ID (a
   never-intentionally-repeated nonce; keeps simultaneous
   sessions in one room from cross-decoding), segment index,
   segment count, flags (FINAL-segment bit, house-token-
@@ -62,19 +67,23 @@ Architecture (one pipeline, modes as data):
   arbitration is out of scope — spec §9.)
 - PAYLOAD SECTION per segment, by mode:
   A "very fast" — the maximum-speed layout: grid200 (39
-     tones), 5 ms symbols, no guard, differential 8-PSK,
-     RS(255,239).
-  B "fast" — grid100 (77 tones), 10 ms symbols + 10 ms
-     guard, differential QPSK, RS(255,191), per-tone
-     selection.
+     tones), 5 ms rectangular symbols, no guard, differential
+     8-PSK, shortened RS(.,.-16).
+  B "fast" — grid100 (77 tones), 10 ms rectangular symbols +
+     10 ms guard, differential QPSK, shortened RS(.,.-32),
+     per-tone selection.
   C "sturdy" — the sounding-passing subset of grid200
      (up to 39 tones), 20 ms symbols + 10 ms guard,
      differential QPSK with soft LLRs into the rate-1/3
      convolutional code + stride interleave.
-- Per-tone selection (modes B/C): tones the sounding shows
-  as interfered or deeply faded are excluded from the
-  session's tone set; the mask travels in every mini-header;
-  excluded capacity is lost, not reassigned.
+  The RS modes send SHORTENED blocks (only the data actually
+  present plus parity) and the mini-header carries each
+  section's exact stored length, so every section is bounded.
+- Per-tone selection (modes B/C; any mode takes an explicit
+  tone_mask from a sender that knows its channel): tones the
+  sounding shows as interfered or deeply faded are excluded
+  from the session's tone set; the mask travels in every
+  mini-header; excluded capacity is lost, not reassigned.
 - Full duplex (all modes): FDD interleaved split of every
   section, each direction a complete adaptive burst on its
   half of the tones; decoding projects the full tone set and
@@ -82,7 +91,7 @@ Architecture (one pipeline, modes as data):
 
 API:
   audio, mode = encode_auto(data, sounding_samples)
-  audio = encode_adaptive(data, mode, analysis=None, ...)
+  audio = encode_adaptive(data, mode, analysis=None, ..., tone_mask=None)
   data  = decode_adaptive(samples, start=None)   (raises SegmentError)
   data  = decode_auto(samples, start=None)       (alias)
   rep   = decode_adaptive_report(samples, start=None, house_secret=None)
@@ -108,9 +117,10 @@ import numpy as np
 
 SR = 48000
 
-# Implementation/document revision. The on-air VERSION byte (8) is a
-# separate, wire-level constant (see the mini-header) and is unchanged.
-__version__ = "8.1.0"
+# Implementation/document revision. The on-air revision byte (WIRE_REV,
+# see the mini-header) is a separate wire-level constant. 8.2 is a
+# clean-slate break: it does not decode, and is not decoded by, 8.0/8.1.
+__version__ = "8.2.0"
 
 # ------------------------------------------------------------ WAV IO
 # 48 kHz mono 16-bit WAV read/write — the file
@@ -433,8 +443,9 @@ def _grid_freqs(lo, hi, step):
 class Cfg:
     """One tone layout + symbol duration + per-tone bit widths."""
 
-    def __init__(self, name, freqs, gains, sym, bits=None):
+    def __init__(self, name, freqs, gains, sym, bits=None, taper=0.25):
         self.name = name
+        self.taper = float(taper)
         self.freqs = np.asarray(freqs, dtype=float)
         self.gains = np.asarray(gains, dtype=float)
         self.sym = int(sym)
@@ -461,7 +472,7 @@ class Cfg:
         if self._basis_cache is None:
             t = np.arange(self.sym)
             win = np.ones(self.sym)
-            r = int(0.25 * self.sym / 2)
+            r = int(self.taper * self.sym / 2)
             if r > 0:
                 win[:r] = 0.5 - 0.5 * np.cos(np.pi * np.arange(r) / r)
                 win[-r:] = win[:r][::-1]
@@ -481,10 +492,17 @@ class Cfg:
         """Sub-layout on a subset of tone indices (duplex halves)."""
         idx = list(idx)
         return Cfg(f"{self.name}[{len(idx)}t]", self.freqs[idx],
-                   self.gains[idx], self.sym, [self.bits[i] for i in idx])
+                   self.gains[idx], self.sym, [self.bits[i] for i in idx],
+                   self.taper)
 
 
-A_LAYOUT = Cfg("grid200@5ms", _grid_freqs(400, 8000, 200), np.ones(39), 240)
+# Rev 8.2: the detector window is rectangular (taper 0) for the dense
+# layouts. A Tukey taper breaks the orthogonality of tones spaced at
+# exactly 1/T, and the augmented projection then amplifies noise by its
+# condition number (measured, rev 8.1: cond 32 for A, 91 for B -> ~10 dB
+# and ~17 dB of lost noise margin: the dominant part of the 8.1 A/B floor).
+A_LAYOUT = Cfg("grid200@5ms", _grid_freqs(400, 8000, 200), np.ones(39), 240,
+               taper=0.0)
 
 
 # ------------------------------------------------------------ layout machinery
@@ -500,17 +518,23 @@ def _gray_tables(w):
     return g, inv
 
 
+def _schroeder(n, sign=1.0):
+    """Schroeder phases for n equal-amplitude tones: a flat-spectrum
+    multisine with a low crest factor (a chirp-like sweep through the
+    whole band once per symbol). Every deterministic symbol in the
+    format uses these, because the burst is peak-normalized: a high-
+    crest preamble would set the scale and pin the data symbols
+    10 dB or more below the speaker's headroom (measured on rev 8.1:
+    preamble/sounding crest 19-25 dB, data 12-15 dB)."""
+    k = np.arange(n)
+    return sign * np.pi * k * k / max(n, 1)
+
+
 def _preamble_phases(cfg):
-    """(PREAMBLE, ntones) absolute phases. Rows 0-2 carry a fixed
-    spread phase per tone (crest control — an all-zero preamble
-    would sum coherently); rows 3-5 add a per-tone pattern jump.
-    Differences are therefore [0, 0, pattern, 0, 0]."""
-    k = np.arange(cfg.ntones)
-    phi = ((5 * k) % 8) * (np.pi / 4)
-    pat = (k % 8) * (np.pi / 4)
-    rows = np.tile(phi, (PREAMBLE, 1))
-    rows[3:] += pat[None, :]
-    return rows, pat
+    """(PREAMBLE, ntones) absolute phases of the payload-section
+    preamble: one low-crest reference symbol (rev 8.2; 8.1 spent six
+    symbols on a pattern preamble)."""
+    return np.tile(_schroeder(cfg.ntones), (PREAMBLE, 1))
 
 
 def _values_to_stream(vals, cfg: Cfg) -> bytes:
@@ -523,33 +547,6 @@ def _values_to_stream(vals, cfg: Cfg) -> bytes:
     return np.packbits(bits.reshape(-1)).tobytes()
 
 
-def _onset_candidates(x, sym):
-    """Onset-contrast candidate offsets (best first) on a sym/4
-    grid: energy of the next PREAMBLE symbols vs the PREAMBLE
-    symbols before the candidate."""
-    cs = np.concatenate([[0.0], np.cumsum(x * x)])
-    step = max(1, sym // 4)
-    last = len(x) - PREAMBLE * sym
-    offs = np.arange(0, last + 1, step)
-    span = PREAMBLE * sym
-    after = cs[np.minimum(offs + span, len(cs) - 1)] - cs[offs]
-    before = cs[offs] - cs[np.maximum(offs - span, 0)]
-    contrast = (after - before) / (after + before + 1e-12)
-    order = np.argsort(contrast)[::-1]
-    cands = []
-    for idx in order:
-        if contrast[idx] <= 0:
-            break
-        off = int(idx) * step
-        if all(abs(off - c) >= sym for c in cands):
-            cands.append(off)
-        if len(cands) >= 12:
-            break
-    if not cands:
-        cands = [int(np.argmax(contrast)) * step]
-    return cands
-
-
 # ------------------------------------------------------------ tone sets
 GRID100 = 400.0 + 100.0 * np.arange(77)      # sounding ph.1 + mode B
 GRID200 = 400.0 + 200.0 * np.arange(39)      # sounding ph.2, modes A/C
@@ -558,7 +555,7 @@ GRID200 = 400.0 + 200.0 * np.arange(39)      # sounding ph.2, modes A/C
 A_TONE_IDX = [int(round((f - 400) / 100)) for f in GRID200]  # in GRID100
 
 # ------------------------------------------------------------ modes (data)
-PREAMBLE = 6                       # payload-section preamble symbols
+PREAMBLE = 1                       # payload-section preamble symbols
 
 
 @dataclass(frozen=True)
@@ -573,17 +570,22 @@ class ModeCfg:
     rs_data: int                   # RS block data bytes (code='rs')
     rs_nsym: int                   # RS parity symbols (code='rs')
     seg_cap: int                   # raw work-chunk cap, bytes
+    taper: float = 0.25            # detector/synthesis window taper
+    scan_step: int = 16            # start-refinement step, samples
 
 
 MODES = {
     # A is the maximum-speed layout (grid200 at 5 ms), defined
     # once above as A_LAYOUT.
     "A": ModeCfg("A", A_LAYOUT.freqs, tuple(A_LAYOUT.gains),
-                 A_LAYOUT.sym, 0, 3, "rs", 239, 16, 3400),
+                 A_LAYOUT.sym, 0, 3, "rs", 239, 16, 3400, 0.0, 4),
+    # B: RS(255,223) (8.1: RS(255,191)) — with the orthogonal detector
+    # nsym 32 survives as far as nsym 64 did (measured, SPEC s14), and
+    # the freed parity is ~17 % more payload per second.
     "B": ModeCfg("B", GRID100, (1.0,) * 77, 480, 480, 2, "rs",
-                 191, 64, 1050),
+                 223, 32, 1200, 0.0, 16),
     "C": ModeCfg("C", GRID200, (1.0,) * 39, 960, 480, 2, "conv",
-                 0, 0, 105),
+                 0, 0, 105, 0.25, 16),
 }
 
 
@@ -595,7 +597,7 @@ def _sel_cfg(mc: ModeCfg, mask, half=None):
     sel = [i for i in idx if mask[i]]
     cfg = Cfg(f"ndap8-{mc.name}", [mc.grid[i] for i in sel],
               [mc.gains[i] for i in sel], mc.active,
-              bits=[mc.bits] * len(sel))
+              bits=[mc.bits] * len(sel), taper=mc.taper)
     return cfg, sel
 
 
@@ -603,7 +605,7 @@ def _full_cfg(mc: ModeCfg) -> Cfg:
     """The mode's complete grid as one Cfg (joint projection
     for duplex decoding)."""
     return Cfg(f"ndap8-{mc.name}-full", list(mc.grid), list(mc.gains),
-               mc.active, bits=[mc.bits] * len(mc.grid))
+               mc.active, bits=[mc.bits] * len(mc.grid), taper=mc.taper)
 
 
 # ------------------------------------------------------------ sounding
@@ -612,35 +614,39 @@ SND2_ACT, SND2_GRD, SND2_N = 960, 480, 4     # 4 x (20 ms + 10 ms)
 SND1_LEN = SND1_SYM * SND1_N                 # 3840
 SND2_LEN = (SND2_ACT + SND2_GRD) * SND2_N    # 5760
 SND_LEN = SND1_LEN + SND2_LEN                # 9600 samples = 0.2 s
-_snd1_cfg = Cfg("snd100", GRID100, np.ones(77), SND1_SYM, bits=[0] * 77)
+_snd1_cfg = Cfg("snd100", GRID100, np.ones(77), SND1_SYM, bits=[0] * 77,
+                taper=0.0)
 _snd2_cfg = Cfg("snd200", GRID200, np.ones(39), SND2_ACT, bits=[0] * 39)
 
 
+# Sounding chirp-sign sequences: each symbol is an up (+1) or down (-1)
+# Schroeder chirp. Non-periodic sign patterns give the correlation
+# finder one unambiguous peak (autocorrelation sidelobes <= ~1/7 for
+# phase 1) while every symbol stays low-crest. Known phases per tone
+# per symbol are all the channel probe needs.
+SND1_SIGNS = (1, 1, 1, -1, -1, 1, -1, 1)
+SND2_SIGNS = (1, 1, -1, 1)
+
+
 def _snd1_phases():
-    k = np.arange(77)
-    base = ((5 * k) % 8) * (np.pi / 4)
-    pat = (k % 8) * (np.pi / 4)
-    return base[None, :] + np.arange(SND1_N)[:, None] * pat[None, :], pat
+    return np.stack([_schroeder(77, sg) for sg in SND1_SIGNS])
 
 
 def _snd2_phases():
-    k = np.arange(39)
-    base = ((5 * k) % 8) * (np.pi / 4)
-    pat = (k % 8) * (np.pi / 4)
-    return base[None, :] + np.arange(SND2_N)[:, None] * pat[None, :], pat
+    return np.stack([_schroeder(39, sg) for sg in SND2_SIGNS])
 
 
 def _sounding_audio(idx1=None, idx2=None):
     """Sounding on subsets of the grids (duplex halves)."""
     win1, E1, _, _ = _snd1_cfg.basis()
-    phi1, _ = _snd1_phases()
+    phi1 = _snd1_phases()
     if idx1 is None:
         idx1 = list(range(77))
     coeffs = np.zeros((SND1_N, 77), dtype=complex)
     coeffs[:, idx1] = np.exp(1j * phi1[:, idx1])
     a1 = (np.real(coeffs @ E1.T) * win1[None, :]).reshape(-1)
     win2, E2, _, _ = _snd2_cfg.basis()
-    phi2, _ = _snd2_phases()
+    phi2 = _snd2_phases()
     if idx2 is None:
         idx2 = list(range(39))
     coeffs2 = np.zeros((SND2_N, 39), dtype=complex)
@@ -791,8 +797,7 @@ def _llrs_to_chan(llrs, cfg: Cfg, pre_rows: int, coded_len: int):
 
 def _pre_rows(cfg: Cfg, style: str, n: int):
     if style == "pattern":
-        rows, _ = _preamble_phases(cfg)
-        return rows
+        return _preamble_phases(cfg)
     k = np.arange(cfg.ntones)
     phi = ((5 * k) % 8) * (np.pi / 4)
     return np.tile(phi, (n, 1))
@@ -855,30 +860,49 @@ def _modulate_bits_g(bits, cfg: Cfg, guard: int, pre_n=PREAMBLE):
 
 
 # ------------------------------------------------- framing (one RS layer)
+# Rev 8.2: shortened, evenly split RS blocks. The framed body
+# (stored bytes + CRC-32) is cut into nb = ceil(len / blk_data)
+# equal blocks of k = ceil(len / nb) data bytes (the last one
+# zero-padded to k INSIDE the codeword and the padding is part of the
+# codeword — only k + nsym bytes per block are transmitted). 8.1 always
+# sent full 255-byte blocks, so an 80-byte message paid for ~250.
 HDR_DATA, HDR_NSYM = 9, 16                 # header RS(25,9)
 HDR_LEN = HDR_DATA + HDR_NSYM
 CHUNK = 400
 STRIDE = CHUNK + HDR_LEN
 FLAG_COMPRESSED = 0x01
+MAX_STORED = 1 << 20                       # sanity cap on a stored length
+
+
+def _rs_plan(slen: int, blk_data: int):
+    """(nb, k): block count and per-block data length for a stored
+    length of slen bytes (+4 CRC-32 bytes)."""
+    total = slen + 4
+    nb = -(-total // blk_data)
+    return nb, -(-total // nb)
+
+
+def _rs_stream_len(slen: int, blk_data: int, blk_nsym: int) -> int:
+    """Bytes in the framed RS stream (blocks + repeated headers)."""
+    nb, k = _rs_plan(slen, blk_data)
+    body = nb * (k + blk_nsym)
+    return body + HDR_LEN * (-(-body // CHUNK))
 
 
 def _frame_rs(stored: bytes, flags: int, blk_data: int,
               blk_nsym: int) -> bytes:
-    """Framing: CRC-32 over the stored bytes,
-    RS blocks, byte interleaving, and an RS(25,9) header
-    (magic 'N8', stored length, block count, flags) repeated
-    before every CHUNK of the interleaved stream."""
+    """Framing: CRC-32 over the stored bytes, shortened RS blocks,
+    byte interleaving across blocks, and an RS(25,9) header (magic
+    'N8', stored length, block count, flags) repeated before every
+    CHUNK of the interleaved stream."""
     crc = zlib.crc32(stored) & 0xFFFFFFFF
     body = stored + struct.pack(">I", crc)
-    blocks = []
-    for i in range(0, len(body), blk_data):
-        chunk = body[i:i + blk_data]
-        if len(chunk) < blk_data:
-            chunk = chunk + b"\x00" * (blk_data - len(chunk))
-        blocks.append(rs_encode(chunk, blk_nsym))
-    nb = len(blocks)
+    nb, k = _rs_plan(len(stored), blk_data)
+    body = body + b"\x00" * (nb * k - len(body))
+    blocks = [rs_encode(body[i * k:(i + 1) * k], blk_nsym)
+              for i in range(nb)]
     stream = bytearray()
-    for i in range(255):
+    for i in range(k + blk_nsym):
         for b in range(nb):
             stream.append(blocks[b][i])
     hdr = (b"N8" + struct.pack(">I", len(stored)) + struct.pack(">H", nb)
@@ -891,7 +915,7 @@ def _frame_rs(stored: bytes, flags: int, blk_data: int,
     return bytes(out)
 
 
-def _read_header_rs(stream: bytes, off: int):
+def _read_header_rs(stream: bytes, off: int, blk_data: int):
     try:
         cand = rs_decode(stream[off:off + HDR_LEN], HDR_NSYM)
     except Exception:
@@ -900,32 +924,38 @@ def _read_header_rs(stream: bytes, off: int):
         slen = struct.unpack(">I", cand[2:6])[0]
         nb = struct.unpack(">H", cand[6:8])[0]
         flags = cand[8]
-        if slen < 10_000_000 and 0 < nb < 10000 and flags & ~FLAG_COMPRESSED == 0:
+        if slen < MAX_STORED and flags & ~FLAG_COMPRESSED == 0 and \
+                nb == _rs_plan(slen, blk_data)[0]:
             return slen, nb, flags
     return None
 
 
-def _unframe_rs(stream: bytes, blk_data: int, blk_nsym: int):
+def _unframe_rs(stream: bytes, blk_data: int, blk_nsym: int,
+                expect_slen: int = None):
     hdr = None
     for off in range(0, max(1, len(stream) - HDR_LEN), STRIDE):
-        hdr = _read_header_rs(stream, off)
+        hdr = _read_header_rs(stream, off, blk_data)
         if hdr is not None:
             break
     if hdr is None:
         raise ValueError("payload header unrecoverable")
     slen, nb, flags = hdr
+    if expect_slen is not None and slen != expect_slen:
+        raise ValueError("payload header disagrees with the mini-header")
+    _, k = _rs_plan(slen, blk_data)
+    n = k + blk_nsym
     data = bytearray()
     pos = 0
-    while pos + HDR_LEN <= len(stream) and len(data) < nb * 255:
+    while pos + HDR_LEN <= len(stream) and len(data) < nb * n:
         pos += HDR_LEN
         data += stream[pos:pos + CHUNK]
         pos += CHUNK
-    data = bytes(data[:nb * 255])
-    if len(data) < nb * 255:
+    data = bytes(data[:nb * n])
+    if len(data) < nb * n:
         raise ValueError("payload stream truncated")
-    blocks = [bytearray(255) for _ in range(nb)]
+    blocks = [bytearray(n) for _ in range(nb)]
     idx = 0
-    for i in range(255):
+    for i in range(n):
         for b in range(nb):
             blocks[b][i] = data[idx]
             idx += 1
@@ -936,6 +966,8 @@ def _unframe_rs(stream: bytes, blk_data: int, blk_nsym: int):
     crc_stored = struct.unpack(">I", bytes(body[slen:slen + 4]))[0]
     if (zlib.crc32(stored) & 0xFFFFFFFF) != crc_stored:
         raise ValueError("CRC-32 mismatch after RS decode")
+    if any(body[slen + 4:]):
+        raise ValueError("non-zero block padding after RS decode")
     return stored, flags
 
 
@@ -966,13 +998,21 @@ def _conv_info(chunk: bytes) -> bytes:
 
 
 def _seg_stored_len(mc: ModeCfg, chunk: bytes) -> int:
-    """The length the mini-header reports for this segment. For
-    RS modes it is the raw chunk length (their framing is
-    self-delimiting); for the convolutional mode the section
-    is not self-delimiting, so it is the exact info length."""
+    """The length the mini-header reports for this segment: the
+    exact number of stored bytes the section carries (rev 8.2 — in
+    8.1 RS modes reported the raw chunk length). Both section kinds
+    are therefore bounded: the receiver knows the section's exact
+    length in samples from the mini-header alone."""
     if mc.code == "conv":
         return len(_conv_info(chunk))
-    return len(chunk)
+    return len(_stored_of(chunk)[0])
+
+
+def _section_nbits(mc: ModeCfg, seglen: int) -> int:
+    """Channel bits in a section carrying `seglen` stored bytes."""
+    if mc.code == "rs":
+        return 8 * _rs_stream_len(seglen, mc.rs_data, mc.rs_nsym)
+    return len(CODE_GENS) * (seglen * 8 + 6)
 
 
 def _encode_section(mc: ModeCfg, chunk: bytes, mask, sub_cfg=None
@@ -998,18 +1038,20 @@ def _decode_section(mc: ModeCfg, samples, start: int, seglen: int,
     else:
         cfg = _sel_cfg(mc, mask)[0]
         proj, col_idx = cfg, None
+    nbits = _section_nbits(mc, seglen)
+    ndata = -(-nbits // cfg.bits_per_sym)
     if mc.code == "rs":
-        coeffs = _slots_coeffs(samples, proj, mc.guard, start)
+        coeffs = _slots_coeffs(samples, proj, mc.guard, start,
+                               PREAMBLE + ndata)
         if col_idx is not None:
             coeffs = coeffs[:, list(col_idx)]
         vals = _values_from_coeffs(coeffs, cfg, PREAMBLE)
         stream = _values_to_stream(vals, cfg)
-        stored, flags = _unframe_rs(stream, mc.rs_data, mc.rs_nsym)
+        stored, flags = _unframe_rs(stream, mc.rs_data, mc.rs_nsym, seglen)
         return _unstored_of(stored, flags)
-    info_len = seglen
-    coded_len = len(CODE_GENS) * (info_len * 8 + 6)
-    nsym = PREAMBLE + -(-coded_len // cfg.bits_per_sym) + 2
-    coeffs = _slots_coeffs(samples, proj, mc.guard, start, nsym)
+    coded_len = nbits
+    coeffs = _slots_coeffs(samples, proj, mc.guard, start,
+                           PREAMBLE + ndata + 2)
     if col_idx is not None:
         coeffs = coeffs[:, list(col_idx)]
     llrs = _qpsk_llrs(coeffs)
@@ -1017,16 +1059,59 @@ def _decode_section(mc: ModeCfg, samples, start: int, seglen: int,
     if len(chan_llr) < coded_len:
         raise ValueError("segment truncated")
     coded = _unpermute(chan_llr, _data_perm_P(coded_len))
-    info = np.packbits(viterbi_decode(coded, info_len * 8,
-                                            CODE_GENS)).tobytes()
+    info = np.packbits(viterbi_decode(coded, seglen * 8,
+                                      CODE_GENS)).tobytes()
     body, crc_b = info[:-4], info[-4:]
     if struct.unpack(">I", crc_b)[0] != (zlib.crc32(body) & 0xFFFFFFFF):
         raise ValueError("CRC-32 mismatch after Viterbi decode")
     return _unstored_of(body[1:], body[0])
 
 
-def _section_samples(mc: ModeCfg, chunk: bytes, seglen: int, mask,
-                     chan=None) -> int:
+ALIGN_SYMS = 64                    # data symbols the alignment metric uses
+ALIGN_RADIUS = 8                   # per-section timing search, samples
+
+
+def _align_error(mc: ModeCfg, samples, start: int, mask, chan=None) -> float:
+    """Timing-alignment metric for a section start: the mean squared
+    distance of the measured differential phases to their nearest
+    constellation points over the section's first ALIGN_SYMS data
+    symbols. It has a sharp minimum at the true alignment (measured:
+    Mode A's decode plateau is only ~+-3 samples wide, 8.2 SPEC s13)
+    and needs no decode, so it also serves as the per-section
+    re-alignment that tracks clock drift."""
+    if chan is not None:
+        proj, col_idx, cfg = chan
+    else:
+        cfg = _sel_cfg(mc, mask)[0]
+        proj, col_idx = cfg, None
+    co = _slots_coeffs(samples, proj, mc.guard, start,
+                       PREAMBLE + ALIGN_SYMS)
+    if col_idx is not None:
+        co = co[:, list(col_idx)]
+    if len(co) < 3:
+        return float("inf")
+    ph = np.angle(co)
+    dp = np.angle(np.exp(1j * (ph[1:] - ph[:-1])))
+    step = 2 * np.pi / (2.0 ** np.array(cfg.bits))
+    err = dp - np.round(dp / step[None, :]) * step[None, :]
+    return float(np.mean(err ** 2))
+
+
+def _align_offset(mc: ModeCfg, samples, start: int, mask, chan=None,
+                  radius: int = ALIGN_RADIUS) -> int:
+    """Best timing correction in [-radius, radius] for a section that
+    should start at `start` (ties go to the smallest correction)."""
+    best, best_d = None, 0
+    for d in sorted(range(-radius, radius + 1), key=abs):
+        if start + d < 0:
+            continue
+        e = _align_error(mc, samples, start + d, mask, chan)
+        if best is None or e < best - 1e-12:
+            best, best_d = e, d
+    return best_d
+
+
+def _section_samples(mc: ModeCfg, seglen: int, mask, chan=None) -> int:
     """Exact section length in samples. In duplex the section
     was encoded on the direction's sub-grid (fewer bits per
     symbol -> more symbols), so bits/symbol comes from the
@@ -1035,12 +1120,7 @@ def _section_samples(mc: ModeCfg, chunk: bytes, seglen: int, mask,
     early (found the hard way: duplex B, segment 1)."""
     bps = chan[2].bits_per_sym if chan is not None \
         else _sel_cfg(mc, mask)[0].bits_per_sym
-    if mc.code == "rs":
-        stored, flags = _stored_of(chunk)
-        nbits = len(_frame_rs(stored, flags, mc.rs_data, mc.rs_nsym)) * 8
-    else:
-        nbits = len(CODE_GENS) * (seglen * 8 + 6)
-    nsyms = PREAMBLE + -(-nbits // bps)
+    nsyms = PREAMBLE + -(-_section_nbits(mc, seglen) // bps)
     return nsyms * (mc.active + mc.guard)
 
 
@@ -1048,7 +1128,12 @@ def _section_samples(mc: ModeCfg, chunk: bytes, seglen: int, mask,
 # A separate seam: these functions know the mini-header's byte
 # layout and its own pentatonic physical layer, nothing about
 # the payload pipeline's internals.
-VERSION = 8                        # the version byte NDAP-8 carries
+# Wire-format revision marker (rev 8.2). Byte 2 of every mini-header,
+# after the magic 'N8'. A clean-slate break: 8.0/8.1 carried 8 here.
+# Future incompatible revisions MUST change this byte and keep the
+# magic/revision/CRC placement, so that a receiver can name the mismatch
+# instead of mis-decoding (see RevisionError).
+WIRE_REV = 0x82
 MINI_INFO = 31                     # fixed for all modes/segments
 MINI_GENS = CODE_GENS        # rate-1/3 convolutional codec
 MINI_CODED_BITS = len(MINI_GENS) * (MINI_INFO * 8 + 6)     # 762
@@ -1078,8 +1163,6 @@ def _mask_bytes(mask) -> bytes:
 
 def _mask_from_bytes(mode: str, raw: bytes):
     n = {"A": 39, "B": 77, "C": 39}[mode]
-    if mode == "A":
-        return [1] * n
     return [1 if (raw[i // 8] >> (7 - i % 8)) & 1 else 0 for i in range(n)]
 
 
@@ -1124,7 +1207,7 @@ def _mini_info_bytes(mode: str, session: int, idx: int, total: int,
         | ((next_speaker & 0x03) << 2)
     raw = bytearray()
     raw += b"N8"
-    raw += bytes([VERSION])
+    raw += bytes([WIRE_REV])
     raw += bytes([{"A": 0, "B": 1, "C": 2}[mode]])
     raw += struct.pack(">H", session)
     raw += bytes([idx, total])
@@ -1142,18 +1225,22 @@ def _mini_parse(raw: bytes):
         return None
     if struct.unpack(">H", raw[29:31])[0] != _crc16(raw[:29]):
         return None
-    if raw[2] != VERSION:
-        return None            # a profile this receiver doesn't speak
+    if raw[2] != WIRE_REV:
+        # the magic and CRC-16 both passed, so this is a genuine header
+        # of another revision: say so, never mis-decode, never shrug.
+        raise RevisionError(raw[2])
     mode = {0: "A", 1: "B", 2: "C"}.get(raw[3])
     if mode is None:
         return None
     seglen = struct.unpack(">I", raw[9:13])[0]
-    if seglen >= 10_000_000:
+    if seglen >= MAX_STORED:
         return None
     if raw[7] == 0 or raw[6] >= raw[7]:
-        return None            # impossible segment index/count (rev 8.1)
+        return None            # impossible segment index/count
     flags = raw[8]
-    return {"mode": mode, "version": raw[2],
+    if flags & 0xF0 or (flags & FLAG_TOKEN) == 0 and any(raw[23:29]):
+        return None            # reserved flag bits / stray token bytes
+    return {"mode": mode, "version": raw[2], "wire_rev": raw[2],
             "session": struct.unpack(">H", raw[4:6])[0],
             "index": raw[6], "total": raw[7], "seglen": seglen,
             "flags": flags, "final": bool(flags & FLAG_FINAL),
@@ -1252,14 +1339,14 @@ def _analyze_at(samples, start: int, idx1=None, idx2=None):
     c1 = _slots_coeffs(samples, _snd1_cfg, 0, start, SND1_N)
     if len(c1) < SND1_N:
         raise ValueError("recording too short for a sounding")
-    phi1, _ = _snd1_phases()
+    phi1 = _snd1_phases()
     s1, g1 = _phase_feats(c1, phi1, idx1)
     full_snr = np.full(77, np.nan)
     full_gain = np.full(77, np.nan)
     full_snr[idx1] = s1
     full_gain[idx1] = g1
     c2 = _slots_coeffs(samples, _snd2_cfg, SND2_GRD, start + SND1_LEN, SND2_N)
-    phi2, _ = _snd2_phases()
+    phi2 = _snd2_phases()
     if len(c2) < SND2_N:
         raise ValueError("recording too short for sounding phase 2")
     s2, g2 = _phase_feats(c2, phi2, idx2)
@@ -1279,29 +1366,21 @@ def _analyze_at(samples, start: int, idx1=None, idx2=None):
 
 
 # Mode-selection thresholds on the 10th-percentile per-tone
-# sounding SINR. These are EFFECTIVE thresholds: measured break
-# points plus a 3 dB safety margin (see spec §5).
-# The sounding SINR is an ISI-inclusive effective measure at the
-# sounding's own timing, not a thermal SNR — hence the low dB
-# values for the guarded modes.
-# A's threshold is 16 dB because flat
-# white-noise soundings read p10_A 6.3-12.6 dB on a channel A
-# cannot decode (the A sounding metric is optimistic when no
-# echo ISI dominates it); every measured A-failing channel
-# reads <= 12.6 and the only A-passing one (clean) reads
-# 104.8, so 16 dB keeps the 3 dB margin over the worst
-# false-pass reading. See spec §5 and §14.
-THR_P10 = {"A": 16.0, "B": -12.0, "C": 5.0}
-
-# Mode B impairment cap (see spec §5): at fixed peak normalization, per-tone
-# power falls as the tone count grows, and 77-tone B measured
-# ~2 dB short of surviving flat 25 dB white noise (0/6 draws)
-# while an arbitrary 47-tone subset passed 3/3. When the
-# sounding's median per-tone SINR shows an impaired channel,
-# B caps its active set at 47 tones (worst scores dropped
-# first); near-clean channels keep the full grid and rate.
-B_IMPAIRED_MEDIAN_DB = 25.0
-B_IMPAIRED_MAX_TONES = 47
+# sounding SINR. These are EFFECTIVE thresholds: break points plus a
+# 3 dB safety margin (see spec §5).
+# Rev 8.2 re-based A's and B's thresholds on the orthogonal detector
+# and the louder low-crest sounding: in flat white noise the sounding's
+# p10 reads about (burst SNR + 8) dB, and the whole-burst break points
+# measured 11 dB (A) and 7.5 dB (B) SNR (SPEC §14), i.e. readings of
+# ~19 and ~15.5; plus 3 dB: A = 22, B = 18. C is carried over from 8.1
+# UNCHANGED (5): it is the last resort before USE_NDAP6, its AWGN break
+# is ~-2 dB SNR (reading ~8), so 5 is lenient rather than margined.
+# CALIBRATION CAVEAT: AWGN only. The 8.1 room-channel readings behind
+# the old values (A=16, B=-12, C=5) are not in the tree and were not
+# re-measured, so the selector's behaviour in echoey rooms is open work
+# (CHANGELOG 8.2.0). The direction of the change is the safe one: B is
+# no longer recommended in noise where it measurably fails.
+THR_P10 = {"A": 22.0, "B": 18.0, "C": 5.0}
 
 
 def recommend_mode(ana) -> str:
@@ -1319,7 +1398,11 @@ def recommend_mode(ana) -> str:
 def mask_from_analysis(ana, mode: str):
     """Per-tone selection for modes B/C: exclude tones whose
     sounding SINR is under the floor or whose relative gain
-    shows a deep fade, but never more than 40% of the set."""
+    shows a deep fade, but never more than 40% of the set. (8.1's
+    "impaired B caps at 47 tones" rule is gone: it compensated for the
+    ill-conditioned 8.1 detector — 77-tone B now passes flat 18 dB
+    noise 3/3.) Mode A takes every tone; a sender that KNOWS its channel
+    is band-limited may still pass its own mask to the encoder."""
     if mode == "A":
         return [1] * 39
     if mode == "B":
@@ -1335,14 +1418,6 @@ def mask_from_analysis(ana, mode: str):
         keep = np.zeros(n, dtype=bool)
         keep[order[-int(math.ceil(0.60 * n)):]] = True
         bad = ~keep
-    if mode == "B" and float(np.nanmedian(snr)) < B_IMPAIRED_MEDIAN_DB:
-        active = int((~bad).sum())
-        if active > B_IMPAIRED_MAX_TONES:
-            score = snr + 20 * np.log10(np.maximum(gain, 1e-3))
-            order = np.argsort(score)
-            act = [i for i in order if not bad[i]]
-            for i in act[:active - B_IMPAIRED_MAX_TONES]:
-                bad[i] = True
     return [0 if b else 1 for b in bad]
 
 
@@ -1373,55 +1448,19 @@ def analyze_channel(samples) -> dict:
 
 
 # ------------------------------------------------------------ finder
-def _sounding_score(samples, off: int, idx1=None) -> float:
-    if idx1 is None:
-        idx1 = list(range(77))
-    coeffs = _slots_coeffs(samples, _snd1_cfg, 0, off, SND1_N)
-    if len(coeffs) < SND1_N:
-        return -1.0
-    phases = np.angle(coeffs[:, idx1])
-    dphi = np.angle(np.exp(1j * (phases[1:] - phases[:-1])))
-    _, pat = _snd1_phases()
-    expected = np.tile(pat[idx1], (SND1_N - 1, 1))
-    return float(np.mean(np.cos(dphi - expected)))
-
-
-def _refined_candidates(samples, idx1=None):
-    """Onset candidates refined by sounding correlation, best
-    first. (No score gate: in the living-room reference channel
-    the true start scores only ~0.42 — candidates are RANKED,
-    and the mini-header CRC does the validating.)"""
-    x = np.asarray(samples, dtype=float)
-    if len(x) < SND_LEN + MINI_LEN:
-        return [0]
-    cands = _onset_candidates(x, SND1_SYM)
-    scored = []
-    for cand in cands:
-        lo = max(0, cand - SND1_SYM)
-        hi = min(len(x) - SND1_LEN, cand + SND1_SYM)
-        if hi < lo:
-            continue
-        loc_off, loc_sc = cand, -2.0
-        for off in range(lo, hi + 1, 8):
-            sc = _sounding_score(x, off, idx1)
-            if sc > loc_sc:
-                loc_sc, loc_off = sc, off
-        for off in range(max(lo, loc_off - 8), min(hi, loc_off + 8) + 1):
-            sc = _sounding_score(x, off, idx1)
-            if sc > loc_sc:
-                loc_sc, loc_off = sc, off
-        scored.append((loc_sc, loc_off))
-    scored.sort(reverse=True)
-    out = []
-    for sc, off in scored:
-        if all(abs(off - o) >= SND1_SYM for o in out):
-            out.append(off)
-    return out or [0]
-
-
 def _find_sounding_offset(samples, idx1=None) -> int:
-    cands = _refined_candidates(samples, idx1)
-    return cands[0]
+    """Start of the sounding in a recording: the strongest normalized
+    cross-correlation peak against the known sounding. Needs no mini-
+    header after it (the analysis path works on a sounding-only
+    recording). Raises ValueError when no peak clears the noise floor
+    — analyze_channel turns that into the degenerate USE_NDAP6
+    analysis. (idx1 is accepted for the duplex call sites; a duplex
+    mix of both halves IS the full sounding, so the full template
+    applies.)"""
+    peaks = _ncc_peaks(samples, 1, tail=0)
+    if not peaks:
+        raise ValueError("no sounding found in the recording")
+    return peaks[0][1]
 
 
 def _seg0_check(x, sec_start: int, mini, chan=None) -> bool:
@@ -1439,6 +1478,10 @@ def _seg0_check(x, sec_start: int, mini, chan=None) -> bool:
         return False
 
 
+def _unguarded(mini) -> bool:
+    return MODES[mini["mode"]].guard == 0
+
+
 def _refine_start_checked(x, off: int, mini, mini_cfg, full_cfg=None,
                           col_idx=None, chan=None):
     """Refine a burst start against segment 0's own full
@@ -1454,7 +1497,11 @@ def _refine_start_checked(x, off: int, mini, mini_cfg, full_cfg=None,
     segment 0's payload fully decoded somewhere in the scan."""
     mini_len = _mini_len(mini_cfg)
     good = []
-    for delta in range(-64, 65, 4):
+    # Mode A's timing plateau is only ~+-5 samples wide (5 ms symbols,
+    # no guard, 8-PSK; measured 8.2), so it is scanned in steps of 4;
+    # the guarded modes' plateaus are >= +-60 samples, steps of 16.
+    step = MODES[mini["mode"]].scan_step
+    for delta in range(-64, 65, step):
         cand = off + delta
         if cand < 0:
             continue
@@ -1463,6 +1510,14 @@ def _refine_start_checked(x, off: int, mini, mini_cfg, full_cfg=None,
     if not good:
         return off, mini, False
     delta = good[len(good) // 2]
+    if _unguarded(mini):
+        # unguarded mode (A): the plateau is only a few samples wide, so
+        # its centre is a coarse guess — take the alignment metric's
+        # minimum around it, provided segment 0 still decodes there.
+        sec0 = off + delta + SND_LEN + mini_len
+        d2 = _align_offset(MODES[mini["mode"]], x, sec0, mini["mask"], chan)
+        if d2 and _seg0_check(x, sec0 + d2, mini, chan):
+            delta += d2
     if delta == 0:
         return off, mini, True
     m2 = _mini_decode(x, off + delta + SND_LEN, mini_cfg, full_cfg,
@@ -1479,25 +1534,12 @@ def _refine_start(x, off: int, mini, mini_cfg, full_cfg=None,
                                  col_idx, chan)[:2]
 
 
-def _find_burst_legacy(samples, mini_cfg=_mini_cfg, full_cfg=None,
-                       col_idx=None):
-    """The NDAP-8 8.0 finder: energy-onset candidates refined by
-    the sounding's phase-1 pattern, validated by the mini-header.
-    Kept as the fallback behind the correlation finder."""
-    x = np.asarray(samples, dtype=float)
-    for off in _refined_candidates(x):
-        mini = _mini_decode(x, off + SND_LEN, mini_cfg, full_cfg, col_idx)
-        if mini is not None and mini["index"] == 0:
-            return _refine_start(x, off, mini, mini_cfg, full_cfg,
-                                 col_idx)
-    raise ValueError("no NDAP-8 burst found (mini-header unrecoverable)")
-
-
 # --- correlation acquisition (NDAP-8 rev 8.1; the idea — sync by
 # normalized cross-correlation with an offset retry ladder — is
 # credited to NDAP-8-P's receiver; this version correlates against
-# the sounding NDAP-8 already transmits, so the on-air format is
-# unchanged).
+# the sounding NDAP-8 transmits — rev 8.2's low-crest chirp-sign
+# sounding, whose sharp unambiguous peak is exact to the sample in
+# clean and moderately noisy recordings).
 ACQ_PEAKS = 6                      # correlation peaks tried, best first
 ACQ_LADDER = (0, -8, 8, -16, 16, -32, 32, -64, 64, -128, 128, -240, 240)
 ACQ_MIN_NCC = 0.02                 # below this a "peak" is just noise
@@ -1515,7 +1557,7 @@ def _snd_reference():
     return _SND_REF
 
 
-def _ncc_peaks(samples, n_peaks=ACQ_PEAKS):
+def _ncc_peaks(samples, n_peaks=ACQ_PEAKS, tail=None):
     """Normalized cross-correlation of the recording against the
     sounding template: ncc[k] = <x[k:k+L], ref> / ||x[k:k+L]||
     (the window mean is removed analytically). Returns up to
@@ -1524,7 +1566,8 @@ def _ncc_peaks(samples, n_peaks=ACQ_PEAKS):
     x = np.asarray(samples, dtype=float)
     ref = _snd_reference()
     L = len(ref)
-    if len(x) < L + MINI_LEN:
+    tail = MINI_LEN if tail is None else tail
+    if len(x) < L + tail:
         return []
     n = 1 << int(np.ceil(np.log2(len(x) + L)))
     c = np.fft.irfft(np.fft.rfft(x, n) * np.conj(np.fft.rfft(ref, n)), n)
@@ -1536,7 +1579,7 @@ def _ncc_peaks(samples, n_peaks=ACQ_PEAKS):
     var = np.maximum(s2 - s1 * s1 / L, 1e-12)   # ||x_w - mean||^2
     ncc = c / np.sqrt(var)                       # ref has zero mean
     # a burst must leave room for its mini-header after the sounding
-    last = len(x) - L - MINI_LEN
+    last = len(x) - L - tail
     if last < 0:
         return []
     ncc = ncc[:last + 1]
@@ -1589,23 +1632,29 @@ def _find_burst_xcorr(samples, mini_cfg=_mini_cfg, full_cfg=None,
     raise ValueError("no NDAP-8 burst found (correlation acquisition)")
 
 
-def _find_burst(samples, mini_cfg=_mini_cfg, full_cfg=None, col_idx=None,
-                method="auto"):
-    """Returns (start, mini_dict) for segment 0. method 'xcorr'
-    tries only the correlation finder, 'legacy' only the 8.0
-    finder, 'auto' (default) correlation first, then the legacy
-    finder. A burst that cannot announce its mode fails loudly."""
-    if method == "legacy":
-        return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx)
-    try:
-        return _find_burst_xcorr(samples, mini_cfg, full_cfg, col_idx)
-    except ValueError:
-        if method == "xcorr":
-            raise
-    return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx)
+def _find_burst(samples, mini_cfg=_mini_cfg, full_cfg=None, col_idx=None):
+    """Returns (start, mini_dict) for segment 0 by correlation
+    acquisition. A burst that cannot announce itself fails loudly
+    (ValueError; RevisionError for a foreign wire revision)."""
+    return _find_burst_xcorr(samples, mini_cfg, full_cfg, col_idx)
 
 
 # ------------------------------------------------------------ segmentation
+class RevisionError(ValueError):
+    """A CRC-valid NDAP-8 header announcing a wire revision this
+    decoder does not speak. Raised loudly by every decode entry point
+    — never a silent failure and never a mis-decode. Carries .rev
+    (the byte found) and .expected."""
+
+    def __init__(self, rev, expected=None):
+        expected = WIRE_REV if expected is None else expected
+        super().__init__(
+            f"NDAP-8 wire revision 0x{rev:02x} is not supported by this "
+            f"decoder (speaks 0x{expected:02x}, rev 8.2): format mismatch")
+        self.rev = rev
+        self.expected = expected
+
+
 class SegmentError(ValueError):
     """Raised by decode_adaptive when any segment fails. Carries
     .failed (segment indices), .ok (indices), .mode, .session."""
@@ -1694,21 +1743,28 @@ def _walk_segments(x, start: int, mini0, mini_cfg=_mini_cfg,
         if mini["index"] == total - 1 and mini["final"]:
             final_seen = True
         sec_start = off + mini_len
+        if mc.guard == 0:
+            # clock drift tracking (8.2): re-align each unguarded section
+            sec_start += _align_offset(mc, x, sec_start, mask, chan)
         try:
             chunk = _decode_section(mc, x, sec_start, mini["seglen"],
                                     mask, chan)
             segments.append({"index": idx, "ok": True, "error": None})
             chunks[idx] = chunk
-            off = sec_start + _section_samples(mc, chunk, mini["seglen"],
-                                               mask, chan)
+            off = sec_start + _section_samples(mc, mini["seglen"], mask,
+                                               chan)
         except Exception as e:
             segments.append({"index": idx, "ok": False,
                              "error": f"{type(e).__name__}: {e}"})
-            # length unknown -> cannot chain; try to resync the
-            # NEXT segment's mini from here.
+            # rev 8.2: the section length is known from the validated
+            # mini-header, so the chain survives a failed section — the
+            # next mini-header is expected exactly after it (the resync
+            # scan still covers a bad guess).
+            off = sec_start + _section_samples(mc, mini["seglen"], mask,
+                                               chan)
             idx += 1
-            mini = None
-            off = sec_start
+            mini = _mini_decode(x, off, mini_cfg, full_cfg, col_idx) \
+                if idx < total else None
             continue
         idx += 1
         if idx < total:
@@ -1739,14 +1795,22 @@ def _walk_segments(x, start: int, mini0, mini_cfg=_mini_cfg,
 # ------------------------------------------------------------ public API
 def encode_adaptive(data: bytes, mode: str, analysis=None,
                     session_id=None, house_secret: bytes = None,
-                    next_speaker: int = 0) -> np.ndarray:
+                    next_speaker: int = 0, tone_mask=None) -> np.ndarray:
     """Encode `data` as a complete NDAP-8 burst at an explicit
     mode ('A'|'B'|'C'). `analysis` (from analyze_channel) drives
-    the per-tone mask; without it all tones are used."""
+    the per-tone mask; without it all tones are used. `tone_mask`
+    (rev 8.2, any mode) is an explicit 0/1 list over the mode's grid
+    for a sender that knows its channel (e.g. band-limited); it wins
+    over `analysis`."""
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}")
     mc = MODES[mode]
-    if analysis is not None:
+    if tone_mask is not None:
+        mask = [1 if m else 0 for m in tone_mask]
+        if len(mask) != len(mc.grid) or not any(mask):
+            raise ValueError("tone_mask must cover the mode's grid and "
+                             "keep at least one tone")
+    elif analysis is not None:
         mask = mask_from_analysis(analysis, mode)
     else:
         mask = [1] * len(mc.grid)
@@ -1805,42 +1869,32 @@ def decode_adaptive_report(samples, start=None,
     never required: a burst decodes identically with no secret,
     a wrong secret, or no token.
 
-    Receiver flow (rev 8.1), every step CRC-gated, first full
+    Receiver flow (rev 8.2), every step CRC-gated, first full
     success wins: (1) correlation acquisition, raw samples;
-    (2) the same start with the slow envelope divided out;
-    (3)-(4) the same two steps from the 8.0 onset/sounding
-    finder, if it lands on a different start. If nothing fully
-    decodes, the attempt with the most good segments is reported
-    (ok=False) — never wrong bytes. The report adds 'start',
-    'acquisition' ('xcorr' | 'legacy' | 'given') and
+    (2) the same start with the slow envelope divided out. If
+    nothing fully decodes, the attempt with the most good segments
+    is reported (ok=False) — never wrong bytes. A CRC-valid header of
+    another wire revision raises RevisionError. The report adds
+    'start', 'acquisition' ('xcorr' | 'given') and
     'envelope_normalized'."""
     x = np.asarray(samples, dtype=float)
-    methods = ["xcorr", "legacy"] if start is None else [None]
-    best, first_err, seen = None, None, set()
-    for method in methods:
+    best, first_err = None, None
+    st = start if start is not None else _find_burst(x)[0]
+    for norm in (False, True):
         try:
-            st = start if method is None else _find_burst(x, method=method)[0]
+            rep = _decode_attempt(x, st, norm)
+        except RevisionError:
+            raise
         except ValueError as e:
             first_err = first_err or e
             continue
-        for norm in (False, True):
-            if (st, norm) in seen:
-                continue
-            seen.add((st, norm))
-            try:
-                rep = _decode_attempt(x, st, norm)
-            except ValueError as e:
-                first_err = first_err or e
-                continue
-            rep["acquisition"] = method or "given"
-            if rep["ok"]:
-                best = rep
-                break
-            if best is None or len(rep["ok_segments"]) > \
-                    len(best["ok_segments"]):
-                best = rep
-        if best is not None and best["ok"]:
+        rep["acquisition"] = "given" if start is not None else "xcorr"
+        if rep["ok"]:
+            best = rep
             break
+        if best is None or len(rep["ok_segments"]) > \
+                len(best["ok_segments"]):
+            best = rep
     if best is None:
         raise first_err
     rep = best
@@ -1925,8 +1979,7 @@ def add_expression(samples, bookends: bool = True, pre=EXPR_PRE,
     There is deliberately NO parameter that warps the burst's
     frequency or time base — that is prohibited (SPEC §19).
     Returns a new array; the input burst's samples are only scaled.
-    Any compliant NDAP-8 decoder (8.0 or later) decodes the result
-    byte-exact."""
+    Any compliant rev 8.2 decoder decodes the result byte-exact."""
     L = EXPR_LIMITS
     if not 0.0 <= prosody_depth <= L["prosody_depth_max"]:
         raise ValueError("prosody_depth outside the Expression Layer limit")
