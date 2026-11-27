@@ -20,6 +20,10 @@
 
 export const SR = 48000;
 
+// Implementation/document revision (the on-air VERSION byte, 8, is a
+// separate wire-level constant and is unchanged).
+export const IMPL_VERSION = "8.1.0";
+
 // ------------------------------------------------------------ byte helpers
 function concatBytes(...parts) {
   let n = 0;
@@ -1286,10 +1290,20 @@ export function _slots_coeffs(samples, cfg, guard, start, nsym = null) {
   const re = new Float64Array(n * N), im = new Float64Array(n * N);
   const tmp = new Float64Array(sym);
   const { re: Pr, im: Pi } = det;
+  let segs = null;                              // envelope-normalized copy (rev 8.1)
+  if (_ENV.on) {
+    segs = new Float64Array(n * sym);
+    for (let i = 0; i < n; i++) {
+      const base = start + i * slot;
+      for (let t = 0; t < sym && base + t < samples.length; t++) segs[i * sym + t] = samples[base + t];
+    }
+    _divide_envelope(segs, n, sym, slot, cfg);
+  }
   for (let i = 0; i < n; i++) {
     const base = start + i * slot;
     let xs, xo;
-    if (base + sym <= samples.length) { xs = samples; xo = base; }
+    if (segs) { xs = segs; xo = i * sym; }
+    else if (base + sym <= samples.length) { xs = samples; xo = base; }
     else {
       tmp.fill(0);
       for (let t = 0; t < sym && base + t < samples.length; t++) tmp[t] = samples[base + t];
@@ -1307,6 +1321,57 @@ export function _slots_coeffs(samples, cfg, guard, start, nsym = null) {
     }
   }
   return { n, ntones: N, re, im };
+}
+
+// --- slow-envelope normalization (NDAP-8 rev 8.1) -------------------
+// Mirrors _divide_envelope in ndap.py: measure the gain in ~5 ms
+// sub-windows of the active windows (power, corrected for the detector
+// window's taper), smooth over three neighbours, interpolate linearly
+// between sub-window centres, scale to unit median, clamp, divide.
+const _ENV = { on: false };                     // single-threaded: a plain flag
+const ENV_SUB = 240;
+const ENV_GAIN_LIMITS = [0.35, 2.5];
+
+function _divide_envelope(segs, n, sym, slot, cfg) {
+  const m = Math.max(1, Math.round(sym / ENV_SUB));       // Python round(): sym/240 is 1, 2 or 4
+  const sub = Math.trunc(sym / m);
+  const win = cfg.basis().win;
+  const wpow = new Float64Array(m);
+  for (let j = 0; j < m; j++) {
+    let a = 0;
+    for (let t = 0; t < sub; t++) a += win[j * sub + t] ** 2;
+    wpow[j] = a / sub;
+  }
+  const K = n * m;
+  let g = new Float64Array(K), cen = new Float64Array(K);
+  for (let i = 0; i < n; i++) for (let j = 0; j < m; j++) {
+    let a = 0;
+    for (let t = 0; t < sub; t++) a += segs[i * sym + j * sub + t] ** 2;
+    g[i * m + j] = Math.sqrt(Math.max(a / sub / wpow[j], 1e-18));
+    cen[i * m + j] = i * slot + (j + 0.5) * sub;
+  }
+  if (K >= 3) {
+    const sm = new Float64Array(K);
+    for (let k = 0; k < K; k++) {
+      const a = g[Math.max(0, k - 1)], b = g[k], c = g[Math.min(K - 1, k + 1)];
+      sm[k] = 0.25 * a + 0.5 * b + 0.25 * c;
+    }
+    g = sm;
+  }
+  const sorted = Float64Array.from(g).sort();
+  const med = K % 2 ? sorted[(K - 1) / 2] : 0.5 * (sorted[K / 2 - 1] + sorted[K / 2]);
+  if (!(med > 0)) return;
+  for (let k = 0; k < K; k++) g[k] = Math.min(ENV_GAIN_LIMITS[1], Math.max(ENV_GAIN_LIMITS[0], g[k] / med));
+  let j = 0;                                                // np.interp walk (positions ascend)
+  for (let i = 0; i < n; i++) for (let t = 0; t < sym; t++) {
+    const pos = i * slot + t + 0.5;
+    while (j < K - 2 && cen[j + 1] <= pos) j++;
+    let e;
+    if (pos <= cen[0]) e = g[0];
+    else if (pos >= cen[K - 1]) e = g[K - 1];
+    else e = g[j] + (g[j + 1] - g[j]) * (pos - cen[j]) / (cen[j + 1] - cen[j]);
+    segs[i * sym + t] /= e;
+  }
 }
 
 // wrapped phase differences between consecutive rows -> Float64Array((n-1)*N)
@@ -1660,6 +1725,7 @@ export function _mini_parse(raw) {
   if (mode === undefined) return null;
   const seglen = rd32(raw, 9);
   if (seglen >= 10_000_000) return null;
+  if (raw[7] === 0 || raw[6] >= raw[7]) return null;     // impossible index/count (rev 8.1)
   const flags = raw[8];
   return { mode, version: raw[2], session: rd16(raw, 4), index: raw[6], total: raw[7], seglen,
            flags, final: !!(flags & FLAG_FINAL), next_speaker: (flags >> 2) & 0x03,
@@ -1904,7 +1970,9 @@ function _seg0_check(x, sec_start, mini, chan = null) {
   } catch (e) { return false; }
 }
 
-function _refine_start(x, off, mini, mini_cfg, full_cfg = null, col_idx = null, chan = null) {
+// Returns [start, mini, verified]: verified is true when segment 0's payload
+// fully decoded somewhere in the scan.
+function _refine_start_checked(x, off, mini, mini_cfg, full_cfg = null, col_idx = null, chan = null) {
   const mini_len = _mini_len(mini_cfg);
   const good = [];
   for (let delta = -64; delta < 65; delta += 4) {
@@ -1912,21 +1980,139 @@ function _refine_start(x, off, mini, mini_cfg, full_cfg = null, col_idx = null, 
     if (cand < 0) continue;
     if (_seg0_check(x, cand + SND_LEN + mini_len, mini, chan)) good.push(delta);
   }
-  if (!good.length) return [off, mini];
+  if (!good.length) return [off, mini, false];
   const delta = good[Math.floor(good.length / 2)];
-  if (delta === 0) return [off, mini];
+  if (delta === 0) return [off, mini, true];
   const m2 = _mini_decode(x, off + delta + SND_LEN, mini_cfg, full_cfg, col_idx);
-  if (m2 === null || m2.index !== 0) return [off, mini];
-  return [off + delta, m2];
+  if (m2 === null || m2.index !== 0) return [off, mini, true];
+  return [off + delta, m2, true];
 }
 
-function _find_burst(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null) {
+function _refine_start(x, off, mini, mini_cfg, full_cfg = null, col_idx = null, chan = null) {
+  return _refine_start_checked(x, off, mini, mini_cfg, full_cfg, col_idx, chan).slice(0, 2);
+}
+
+function _find_burst_legacy(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null) {
   const x = samples;
   for (const off of _refined_candidates(x)) {
     const mini = _mini_decode(x, off + SND_LEN, mini_cfg, full_cfg, col_idx);
-    if (mini !== null && mini.index === 0) return _refine_start(x, off, mini, mini_cfg, full_cfg);
+    if (mini !== null && mini.index === 0) return _refine_start(x, off, mini, mini_cfg, full_cfg, col_idx);
   }
   throw new Error("no NDAP-8 burst found (mini-header unrecoverable)");
+}
+
+// --- correlation acquisition (NDAP-8 rev 8.1) -------------------------
+// Mirrors ndap.py: normalized cross-correlation against the known
+// sounding, ranked peaks, each tried at a ladder of small offsets until
+// a mini-header validates. The idea (sync by normalized cross-correlation
+// with an offset retry ladder) is credited to NDAP-8-P's receiver.
+const ACQ_PEAKS = 6;
+const ACQ_LADDER = [0, -8, 8, -16, 16, -32, 32, -64, 64, -128, 128, -240, 240];
+const ACQ_MIN_NCC = 0.02;
+let _SND_REF = null;
+
+function _snd_reference() {
+  if (_SND_REF === null) {
+    const r = Float64Array.from(_sounding_audio());
+    let mean = 0;
+    for (let i = 0; i < r.length; i++) mean += r[i];
+    mean /= r.length;
+    let nrm = 0;
+    for (let i = 0; i < r.length; i++) { r[i] -= mean; nrm += r[i] * r[i]; }
+    nrm = Math.sqrt(nrm);
+    for (let i = 0; i < r.length; i++) r[i] /= nrm;
+    _SND_REF = r;
+  }
+  return _SND_REF;
+}
+
+// In-place iterative radix-2 complex FFT (n a power of two).
+function _fft(re, im, inverse) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (inverse ? 2 : -2) * Math.PI / len, half = len >> 1;
+    const wr = new Float64Array(half), wi = new Float64Array(half);
+    for (let k = 0; k < half; k++) { wr[k] = Math.cos(ang * k); wi[k] = Math.sin(ang * k); }
+    for (let i = 0; i < n; i += len) {
+      for (let k = 0; k < half; k++) {
+        const a = i + k, b = a + half;
+        const tr = re[b] * wr[k] - im[b] * wi[k], ti = re[b] * wi[k] + im[b] * wr[k];
+        re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+      }
+    }
+  }
+  if (inverse) for (let i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+}
+
+export function _ncc_peaks(samples, n_peaks = ACQ_PEAKS) {
+  const x = samples, ref = _snd_reference(), L = ref.length;
+  if (x.length < L + MINI_LEN) return [];
+  const last = x.length - L - MINI_LEN;
+  if (last < 0) return [];
+  let n = 1;
+  while (n < x.length + L) n <<= 1;
+  const ar = new Float64Array(n), ai = new Float64Array(n);
+  ar.set(x);
+  const br = new Float64Array(n), bi = new Float64Array(n);
+  br.set(ref);
+  _fft(ar, ai, false); _fft(br, bi, false);
+  for (let i = 0; i < n; i++) {                           // A * conj(B)
+    const r = ar[i] * br[i] + ai[i] * bi[i], m = ai[i] * br[i] - ar[i] * bi[i];
+    ar[i] = r; ai[i] = m;
+  }
+  _fft(ar, ai, true);
+  const cs = new Float64Array(x.length + 1), cs2 = new Float64Array(x.length + 1);
+  for (let i = 0; i < x.length; i++) { cs[i + 1] = cs[i] + x[i]; cs2[i + 1] = cs2[i] + x[i] * x[i]; }
+  const ncc = new Float64Array(last + 1);
+  for (let k = 0; k <= last; k++) {
+    const s1 = cs[k + L] - cs[k], s2 = cs2[k + L] - cs2[k];
+    ncc[k] = ar[k] / Math.sqrt(Math.max(s2 - s1 * s1 / L, 1e-12));
+  }
+  const order = Array.from(ncc.keys()).sort((p, q) => ncc[q] - ncc[p] || p - q);
+  const out = [];
+  for (const k of order) {
+    if (ncc[k] < ACQ_MIN_NCC || out.length >= n_peaks) break;
+    if (out.every(([, o]) => Math.abs(k - o) >= SND1_SYM)) out.push([ncc[k], k]);
+  }
+  return out;
+}
+
+function _find_burst_xcorr(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null) {
+  // A validating mini-header is necessary, not sufficient (it tolerates 100+
+  // samples of start error): each one is refined against segment 0's payload,
+  // and the ladder skips offsets inside an already-scanned +-64 window until
+  // one verifies. If none does, the first validating candidate is returned.
+  const x = samples;
+  let fallback = null;
+  for (const [, peak] of _ncc_peaks(x)) {
+    const scanned = [];
+    for (const d of ACQ_LADDER) {
+      const off = peak + d;
+      if (off < 0 || off + SND_LEN + _mini_len(mini_cfg) > x.length) continue;
+      if (scanned.some((o) => Math.abs(off - o) <= 56)) continue;
+      const mini = _mini_decode(x, off + SND_LEN, mini_cfg, full_cfg, col_idx);
+      if (mini === null || mini.index !== 0) continue;
+      scanned.push(off);
+      const [st, m2, verified] = _refine_start_checked(x, off, mini, mini_cfg, full_cfg, col_idx);
+      if (verified) return [st, m2];
+      if (fallback === null) fallback = [st, m2];
+    }
+  }
+  if (fallback !== null) return fallback;
+  throw new Error("no NDAP-8 burst found (correlation acquisition)");
+}
+
+function _find_burst(samples, mini_cfg = _mini_cfg, full_cfg = null, col_idx = null, method = "auto") {
+  if (method === "legacy") return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx);
+  try { return _find_burst_xcorr(samples, mini_cfg, full_cfg, col_idx); }
+  catch (e) { if (method === "xcorr") throw e; }
+  return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx);
 }
 
 // ------------------------------------------------------------ segmentation
@@ -2062,15 +2248,47 @@ export function encode_auto(data, sounding_samples) {
   return [encode_adaptive(data, mode, { analysis: ana }), mode];
 }
 
+function _decode_attempt(x, start, norm) {
+  const prev = _ENV.on;
+  _ENV.on = norm;
+  try {
+    const mini0 = _mini_decode(x, start + SND_LEN);
+    if (mini0 === null || mini0.index !== 0) throw new Error("mini-header unrecoverable at given start");
+    const rep = _walk_segments(x, start, mini0);
+    rep.start = start;
+    rep.envelope_normalized = norm;
+    return rep;
+  } finally { _ENV.on = prev; }
+}
+
+// Receiver flow (rev 8.1), every step CRC-gated, first full success wins:
+// correlation acquisition raw, same start envelope-normalized, then the
+// 8.0 finder's start (if different) raw and normalized. If nothing fully
+// decodes, the attempt with the most good segments is reported (ok=false).
 export function decode_adaptive_report(samples, start = null, house_secret = null) {
   const x = samples instanceof Float64Array ? samples : Float64Array.from(samples);
-  let mini0;
-  if (start === null) [start, mini0] = _find_burst(x);
-  else {
-    mini0 = _mini_decode(x, start + SND_LEN);
-    if (mini0 === null || mini0.index !== 0) throw new Error("mini-header unrecoverable at given start");
+  const methods = start === null ? ["xcorr", "legacy"] : [null];
+  let best = null, first_err = null;
+  const seen = new Set();
+  for (const method of methods) {
+    let st;
+    try { st = method === null ? start : _find_burst(x, _mini_cfg, null, null, method)[0]; }
+    catch (e) { first_err = first_err || e; continue; }
+    for (const norm of [false, true]) {
+      const key = `${st}/${norm}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let rep;
+      try { rep = _decode_attempt(x, st, norm); }
+      catch (e) { first_err = first_err || e; continue; }
+      rep.acquisition = method || "given";
+      if (rep.ok) { best = rep; break; }
+      if (best === null || rep.ok_segments.length > best.ok_segments.length) best = rep;
+    }
+    if (best !== null && best.ok) break;
   }
-  const rep = _walk_segments(x, start, mini0);
+  if (best === null) throw first_err;
+  const rep = best;
   if (rep.ok && house_secret !== null && rep.house_token) {
     const expect = house_token(rep.session, crc32(rep.data), house_secret);
     rep.house_token_ok = bytesEqual(expect, rep.house_token);
@@ -2087,6 +2305,79 @@ export function decode_adaptive(samples, start = null) {
 export const decode_auto = decode_adaptive;
 export const encode_fast = encode_adaptive;
 export const decode_fast = decode_adaptive;
+
+// ------------------------------------------------------- expression layer
+// Optional, sender-side, data-free (SPEC section 19); mirrors add_expression
+// in ndap.py. Bookend whistles before/after the burst plus a gentle slow
+// amplitude contour. There is deliberately no parameter that warps the
+// burst's own frequency or time base.
+export const EXPR_PRE = [[660.0, 880.0, 0.14], [880.0, 1175.0, 0.16]];
+export const EXPR_POST = [[1175.0, 880.0, 0.14], [880.0, 587.0, 0.20]];
+export const EXPR_LIMITS = {
+  prosody_depth_max: 0.40, prosody_hz_max: 8.0, phrase_freq_hz: [200.0, 4000.0],
+  phrase_max_s: 1.5, gap_min_s: 0.10, gap_max_s: 1.0, bookend_level_max: 0.85,
+};
+
+function _whistle(phrase, level) {
+  const notes = [];
+  let ph = 0.0, total = 0;
+  for (const [f0, f1, dur] of phrase) {
+    const n = Math.round(dur * SR);
+    if (n <= 0) continue;
+    const note = new Float64Array(n);
+    let acc = 0;                                  // cumulative sum of the frequency ramp
+    for (let i = 0; i < n; i++) {
+      const f = n > 1 ? f0 + (f1 - f0) * i / (n - 1) : f0;
+      acc += f;
+      note[i] = Math.sin(ph + 2 * Math.PI * acc / SR);
+    }
+    ph = (ph + 2 * Math.PI * acc / SR) % (2 * Math.PI);
+    const k = Math.min(n >> 1, Math.trunc(0.012 * SR));
+    for (let i = 0; i < k; i++) {
+      const r = 0.5 - 0.5 * Math.cos(Math.PI * i / k);
+      note[i] *= r; note[n - 1 - i] *= r;
+    }
+    notes.push(note); total += n;
+  }
+  const out = new Float64Array(total);
+  let o = 0;
+  for (const note of notes) { for (let i = 0; i < note.length; i++) out[o + i] = level * note[i]; o += note.length; }
+  return out;
+}
+
+export function add_expression(samples, opts = {}) {
+  const { bookends = true, pre = EXPR_PRE, post = EXPR_POST, prosody_depth = 0.25,
+          prosody_hz = 2.0, prosody_phase = 0.0, gap_s = 0.15, bookend_level = 0.6 } = opts;
+  const L = EXPR_LIMITS;
+  if (!(prosody_depth >= 0 && prosody_depth <= L.prosody_depth_max)) throw new Error("prosody_depth outside the Expression Layer limit");
+  if (!(prosody_hz >= 0 && prosody_hz <= L.prosody_hz_max)) throw new Error("prosody_hz outside the Expression Layer limit");
+  if (!(gap_s >= L.gap_min_s && gap_s <= L.gap_max_s)) throw new Error("gap_s outside the Expression Layer limit");
+  if (!(bookend_level >= 0 && bookend_level <= L.bookend_level_max)) throw new Error("bookend_level outside the Expression Layer limit");
+  const x = samples;
+  const body = new Float64Array(x.length);
+  let peak = 0;
+  for (let i = 0; i < x.length; i++) {
+    const g = 1.0 - prosody_depth * (0.5 - 0.5 * Math.cos(2 * Math.PI * prosody_hz * (i / SR) + prosody_phase));
+    body[i] = x[i] * g;
+    if (Math.abs(x[i]) > peak) peak = Math.abs(x[i]);
+  }
+  if (!bookends) return body;
+  if (!x.length) peak = 1.0;
+  const [lo, hi] = L.phrase_freq_hz;
+  const parts = [];
+  for (const phrase of [pre, post]) {
+    const total = phrase.reduce((a, n) => a + n[2], 0);
+    if (total > L.phrase_max_s || phrase.some(([f0, f1]) => !(f0 >= lo && f0 <= hi && f1 >= lo && f1 <= hi))) {
+      throw new Error("bookend phrase outside the Expression Layer limits");
+    }
+    parts.push(_whistle(phrase, bookend_level * peak));
+  }
+  const gap = new Float64Array(Math.round(gap_s * SR));
+  const out = new Float64Array(parts[0].length + gap.length * 2 + body.length + parts[1].length);
+  let o = 0;
+  for (const seg of [parts[0], gap, body, gap, parts[1]]) { out.set(seg, o); o += seg.length; }
+  return out;
+}
 
 // ------------------------------------------------------------ duplex
 const _half_idx = (n, which) => { const r = []; for (let i = which; i < n; i += 2) r.push(i); return r; };

@@ -105,6 +105,16 @@ audio = ndap.encode_adaptive(data, "B")
 data = ndap.decode_adaptive(samples)
 ```
 
+Optional Expression Layer (SPEC.md section 19): wrap a burst in
+bookend whistles and gentle amplitude prosody. Character lives
+only in layers that carry no data; warping the burst itself is
+prohibited because it destroys the differential-phase data.
+
+```python
+y = ndap.add_expression(ndap.encode_adaptive(data, "B"))
+ndap.decode_adaptive(y)          # byte-exact; so does a rev 8.0 receiver
+```
+
 CLI:
 
 ```
@@ -122,6 +132,19 @@ It is off by default, never required to decode, and is
 authentication only - NDAP audio is decodable by anyone
 with the specification and is not encryption. See SPEC.md
 section 10.
+
+## Revision 8.1
+
+The on-air format is unchanged (wire version byte 8; every 8.0
+burst decodes, every 8.1 burst is an 8.0 burst). The receiver now
+acquires the burst by normalized cross-correlation against the
+sounding with an offset retry ladder, falling back to the 8.0
+finder, retries with the slow gain envelope divided out, and
+validates mini-headers more strictly; an optional Expression
+Layer lets senders add data-free character. Details and measured
+before/after numbers: `CHANGELOG.md` and SPEC.md sections 12, 14,
+19. Run the tests with `python3 -m unittest discover -s tests -v`
+(and `npm test` in `js/`).
 
 ## Conformance
 

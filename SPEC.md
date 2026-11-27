@@ -1,4 +1,13 @@
-# NDAP-8 - Narrowband Data-over-Audio Protocol, version 8
+# NDAP-8 - Narrowband Data-over-Audio Protocol, version 8 (revision 8.1)
+
+**Revision 8.1 (2026-11-27).** The on-air format is unchanged:
+the wire `VERSION` byte stays 8, every rev 8.0 burst decodes under
+8.1, and every 8.1 burst is a valid 8.0 burst (§18 vectors are
+byte-identical). What changed is the receiver (§12: correlation
+acquisition with a retry ladder, slow-envelope normalization,
+stricter mini-header validity in §8.1) and one optional
+sender-side addition (§19, the Expression Layer). See
+`CHANGELOG.md`.
 
 **Completeness standard.** This specification is written so
 that a competent implementer with no access to `ndap.py` can
@@ -350,7 +359,10 @@ PENTA tones with the §7.2 convolutional codec.
 CRC-16 is CRC-16/CCITT-FALSE (a.k.a. CRC-HQX): polynomial
 0x1021, initial value 0xFFFF, no input reflection, no output
 reflection, no final XOR. A mini-header whose CRC fails, whose magic
-is wrong, or whose VERSION is not 8 is invalid: the
+is wrong, whose VERSION is not 8, whose segment total is 0, or whose
+segment index is not below the segment total (rev 8.1: no sender
+produces these; a receiver that accepted them could be steered by a
+CRC-valid but nonsensical header) is invalid: the
 receiver treats the burst as not found (loudly), never
 guesses. The version byte is how a receiver knows what it
 is hearing; a house known to hold only an older profile is
@@ -454,26 +466,84 @@ mini-header overhead: measured examples in §14.
 
 ## 12. Receiver flow, resync, and NACK
 
-Reference receiver flow (the format is what's normative;
-the search is receiver-internal):
+Reference receiver flow. The format is what is normative; the
+search is receiver-internal, except where marked **(strict)**,
+which every receiver must do:
 
-1. Find the sounding: energy-onset candidates, ranked by
-   correlation with the known phase-1 pattern; validate by
-   decoding segment 0's mini-header (CRC-16).
-2. Refine the start: scan a small window around the
-   candidate and keep the centre of the plateau over which
-   segment 0's *payload section* decodes exactly. (Cheaper refinements — mini-header soft-score
-   refinement, header-only plateau checks, and the sounding
-   correlation peak — were measured and found unreliable.)
-3. Walk the segments: each mini-header gives the next
+1. **Acquire by correlation (rev 8.1, primary).** The sounding
+   (§3) is a fixed, known waveform. Let `ref` be the sounding
+   audio (the 9,600 samples a sender emits, peak-normalized
+   to 0.85), mean removed and scaled to unit norm, and `L` its
+   length. For every offset `k` of the recording compute the
+   normalized cross-correlation
+
+       ncc[k] = Σ x[k+i]·ref[i] / sqrt( Σ (x[k+i] − mean_k)² )
+
+   (the window mean is removed in the denominator; `ref` has zero
+   mean, so the numerator needs no correction). Offsets must
+   leave room for a mini-header after the sounding. Take the
+   strongest peaks, at least 480 samples apart, with ncc ≥ 0.02,
+   up to 6. For each peak, try the **offset retry ladder**
+   0, −8, +8, −16, +16, −32, +32, −64, +64, −128, +128, −240,
+   +240 samples: decode the mini-header at (peak + offset +
+   9,600) and accept the first that validates with segment
+   index 0. Work is bounded: at most 6 × 13 mini-header decodes.
+   A raw correlation peak is not trusted to be the start:
+   the ladder absorbs skew from filtering, and step 2 refines.
+   (Idea credited to NDAP-8-P, whose receiver acquires by
+   normalized cross-correlation with an offset retry ladder;
+   here the template is NDAP-8's own sounding, so nothing on the
+   air changes.)
+2. **Refine the start.** Scan ±64 samples around the candidate
+   and keep the centre of the plateau over which segment 0's
+   *payload section* decodes exactly. (Cheaper refinements —
+   mini-header soft-score refinement, header-only plateau
+   checks, and the sounding correlation peak — were measured and
+   found unreliable.)
+3. **Fall back (rev 8.0 finder).** If step 1 finds no
+   mini-header, or the burst does not decode, a receiver may
+   repeat from the rev 8.0 search: energy-onset candidates,
+   ranked by correlation with the known phase-1 pattern and
+   validated by the mini-header. The reference decodes with the
+   correlation start first and tries the rev 8.0 start only if
+   it differs.
+4. **Walk the segments.** Each mini-header gives the next
    section's exact length (§7, §8.1 seglen), so segment
    boundaries chain deterministically. If a mini-header
    fails mid-burst, resync with a bounded scan (the
    reference uses a 4 s window) plus soft-score refinement;
    segments that cannot be recovered are reported failed,
    not silently skipped.
-4. Reassemble, verify the §6 CRC-32, report per-segment
-   results.
+5. **Normalize the slow envelope (rev 8.1, retry).** If the raw
+   walk does not fully decode, repeat it with the slow gain
+   envelope divided out (informative algorithm below). Phone
+   AGC, a tremolo, or a deliberate slow envelope multiply the
+   burst by a gain that varies over tens of milliseconds; the
+   data is differential phase, so most of it survives, but the
+   ripple inside a symbol window bends the least-squares
+   projection. The reference measures the gain in 5 ms
+   sub-windows of each slot's *active* window only (never the
+   silent guards), as power corrected for the detector window's
+   taper; smooths over three neighbouring sub-windows (~15 ms);
+   interpolates linearly between sub-window centres; scales to
+   unit median; clamps to [0.35, 2.5]; and divides the active
+   samples by it before projection. It runs on the same slot grid
+   the detector uses, so it needs no side information. It never
+   replaces the raw attempt: a burst that decodes raw is never
+   normalized.
+6. **Gate (strict).** Reassemble, verify the §6 CRC-32 over the
+   whole message, and report per-segment results. Every
+   attempt above is gated by the same checks (mini-header
+   CRC-16, per-segment RS/Viterbi + CRC-32, full-message
+   CRC-32). The first attempt that fully decodes wins; if none
+   does, the attempt with the most good segments is reported,
+   with its failed indices. No attempt, fallback, or
+   normalization may emit bytes that did not pass the gates:
+   a wrong decode surfaces as failure, never as wrong bytes.
+
+The Expression Layer (§19) places data-free audio before and
+after the burst; correlation acquisition does not depend on
+silence before the sounding, so bookends do not disturb it.
 
 **NACK convention.** A receiver reports the failed segment
 indices over whatever return channel exists; only those
@@ -609,6 +679,26 @@ designed behaviour.
 - The house token authenticates origin to a secret-holder.
   It does not encrypt, and verbatim replay is a known
   residual risk (§10).
+- Correlation acquisition fixes *finding* the burst, not the
+  physical-layer floor. Through white Gaussian noise the
+  limits are the modes' own: A and B (denser constellations, RS
+  codes with little margin) still fail at 30 dB SNR even though
+  the start is found exactly; C, with its rate-⅓ code, keeps
+  decoding well below the levels where the rev 8.0 finder lost
+  the burst (§14, rev 8.1 table).
+- The slow-envelope normalizer (§12 step 5) is a retry, and its
+  measured rescue rate is small: once acquisition is by
+  correlation, a 0.60–1.00 envelope at 25 Hz decodes raw in
+  every mode. It cannot invent signal-to-noise ratio that a
+  deep envelope removes, and in the guarded modes (B, C) it has
+  only two to four sub-window measurements per slot, so envelopes
+  faster than about 25 Hz are not tracked.
+- `analyze_channel` was not changed in 8.1. Fed a sounding that
+  had passed through a 250–4,200 Hz bandpass, it recommended
+  USE_NDAP6 and, for mode C, produced a tone mask lying above
+  3.4 kHz (the band the filter removed). Senders that know their
+  channel is band-limited should mask to the passband
+  themselves; this was observed, not investigated.
 - Nothing in this build has touched live air. Every number
   here is from the simulated harness; §16 exists because
   the first real recording will differ.
@@ -632,6 +722,83 @@ correction capacity — expected decode: EXACT), and
 loud failure). Appendix B states the conformance criteria,
 including why the corrupt vectors exist.
 
+## 19. Expression Layer (optional, rev 8.1)
+
+NDAP-8 bursts are not pleasant to hear, and people want to give
+them character. The rule that makes this safe is one sentence:
+**character lives only in layers that carry no data.** NDAP's data
+is the differential phase of every tone from one 5 ms-class symbol
+to the next, so anything that moves the burst's frequencies or
+timing moves the data. Measured (the "R2" expression experiments):
+a common pitch glide (equivalently a time warp) over a burst
+destroyed decoding at *every* depth tried, 0.3 % to 1.0 %;
+whistle bookends before and after the burst, and gentle amplitude
+prosody over it, decoded byte-exact and scored identically to
+plain bursts in noise tests.
+
+**Permitted (sender side, optional):**
+
+- *Bookend phrases.* Any audio before the sounding (the **pre**
+  phrase) and after the last segment (the **post** phrase),
+  separated from the burst by silence: whistles, notes, glides,
+  a spoken word. The reference limits each phrase to ≤ 1.5 s,
+  200–4,000 Hz, at most 0.85 of the burst's peak level, with
+  0.10–1.0 s of silence between the phrase and the burst
+  (reference default 0.15 s). Glides *inside a bookend* are fine —
+  they are not part of the burst.
+- *Amplitude prosody.* A slow gain contour over the burst, with
+  gain in [1 − depth, 1]. The reference limits are depth ≤ 0.40
+  (gain never below 0.60) and contour rate ≤ 8 Hz. The gain
+  never exceeds 1, so the burst's peak level is preserved.
+  Faster or deeper contours are the §12 step-5 regime and are
+  not guaranteed.
+
+**Prohibited:** any frequency or time warp of the burst itself —
+pitch glide, vibrato, time stretch, resampling, speed change,
+frequency shift, or any other common or per-tone modulation of
+the tone frequencies or symbol clock between the first
+sounding sample and the last payload sample. A burst so
+treated is not an NDAP-8 burst; receivers owe it nothing, and
+the reference implementation exposes no parameter that could
+produce one.
+
+**Receiver impact: none required.** An 8.0 receiver decodes an
+expression-wrapped burst (verified); an 8.1 receiver does too,
+because correlation acquisition (§12) finds the sounding
+wherever it is. A receiver may ignore everything outside the
+burst. A sender should not rely on listeners hearing the
+bookends: a recording path may trim silence.
+
+Reference helpers: `add_expression(samples, bookends=True,
+pre=EXPR_PRE, post=EXPR_POST, prosody_depth=0.25,
+prosody_hz=2.0, prosody_phase=0.0, gap_s=0.15,
+bookend_level=0.6)` in `ndap.py`, mirrored in `js/src/ndap.js`;
+the limits above are `EXPR_LIMITS`. Out-of-range arguments raise
+rather than clip. The default bookends are a rising two-glide
+phrase before the burst (660→880→1,175 Hz, 0.30 s) and a falling
+one after (1,175→880→587 Hz, 0.34 s).
+
+## 20. Roadmap (not part of this specification)
+
+**Singing profile (common-mode-tracking decoder).** The R2
+result suggests a path to a burst that *sings*: apply a common
+pitch contour to every tone together, and have the receiver
+estimate it. The idea: with all tones moved by the same factor
+`(1+ε(t))`, the *average* phase drift across all tones is the
+common-mode term, observable directly from the sounding-style
+pilot structure or from the data tones themselves (the data phases
+are uniformly distributed, so their circular mean carries the
+common drift while the differential data averages out). A
+decoder would track that common mode per symbol, subtract it, and
+only then take differential phase. Open questions: how much
+common-mode excursion the 5 ms symbols can absorb before inter-tone
+projection leakage dominates; whether a known pilot tone is
+needed to avoid data-dependent bias; and the mini-header, which
+would need the same treatment or a flat (unsung) rendering. This
+is a roadmap note, **not code and not a format** — until a
+receiver exists and measures it, §19's prohibition on warping the
+burst stands.
+
 ## Appendix A. Reserved technique: envelope-class detection (not adopted)
 
 A known periodic gain envelope (a 25 Hz "purr", period
@@ -643,6 +810,11 @@ pseudoinverse per phase class with the envelope folded into
 the basis, and detection stays exact under the modulation.
 The technique is sound and is recorded here as a reserved
 option for a future profile that wants an audible signature.
+
+Rev 8.1 note: slow envelopes the sender did *not* announce (phone AGC,
+tremolo, a purr from another house) are handled blind by §12 step 5;
+this appendix is about announcing one so the receiver can fold it
+into the detector exactly.
 
 It is **not adopted in NDAP-8**, because performance is not
 traded for pleasantness. Its measured costs: the envelope

@@ -102,10 +102,15 @@ CLI:
   python3 ndap.py auto sounding.wav "text" out.wav
 """
 import sys, os, math, struct, wave, zlib, binascii, hashlib, hmac
+import contextvars
 from dataclasses import dataclass
 import numpy as np
 
 SR = 48000
+
+# Implementation/document revision. The on-air VERSION byte (8) is a
+# separate, wire-level constant (see the mini-header) and is unchanged.
+__version__ = "8.1.0"
 
 # ------------------------------------------------------------ WAV IO
 # 48 kHz mono 16-bit WAV read/write — the file
@@ -681,7 +686,52 @@ def _slots_coeffs(samples, cfg: Cfg, guard: int, start: int, nsym=None):
     if n <= 0:
         return np.empty((0, cfg.ntones), dtype=complex)
     segs = np.stack([x[i * slot:i * slot + cfg.sym] for i in range(n)])
+    if _ENV_NORM.get():
+        segs = _divide_envelope(segs, cfg, slot)
     return (segs @ PINV.T)[:, :cfg.ntones]
+
+
+# --- slow-envelope normalization (NDAP-8 rev 8.1) -------------------
+# Phone AGC, a tremolo, or a deliberate slow "purr" multiplies the
+# burst by a slowly varying gain. The data is differential phase, so
+# it survives most of that, but the gain ripple inside a symbol
+# window bends the least-squares projection. After sync the
+# receiver can estimate the gain from the burst itself and divide it
+# out. Estimation is slot-aware (it measures only the active
+# windows, never the silent guards) and runs on the same slot grid
+# the detector uses, so it needs no extra side information.
+_ENV_NORM = contextvars.ContextVar("ndap_env_norm", default=False)
+ENV_SUB = 240                       # sub-window length: 5 ms
+ENV_GAIN_LIMITS = (0.35, 2.5)       # clamp vs the burst's median gain
+
+
+def _divide_envelope(segs, cfg: Cfg, slot: int):
+    """segs: (n, sym) active windows of consecutive slots. Returns
+    segs divided by a smoothed per-sample gain envelope. The gain
+    is measured in ~5 ms sub-windows (power, corrected for the
+    detector window's taper), smoothed over three neighbours
+    (~15 ms), and interpolated linearly between sub-window centres
+    (across the guards). The result is scaled so the burst's median
+    gain is 1: only the ripple is removed, not the level."""
+    n, sym = segs.shape
+    m = max(1, int(round(sym / ENV_SUB)))
+    sub = sym // m
+    win = cfg.basis()[0]
+    wpow = (win[:m * sub] ** 2).reshape(m, sub).mean(axis=1)    # taper
+    pw = (segs[:, :m * sub] ** 2).reshape(n, m, sub).mean(axis=2) / wpow
+    g = np.sqrt(np.maximum(pw.reshape(-1), 1e-18))
+    cen = (np.arange(n)[:, None] * slot + (np.arange(m)[None, :] + 0.5)
+           * sub).reshape(-1)
+    if len(g) >= 3:
+        gp = np.concatenate([[g[0]], g, [g[-1]]])
+        g = 0.25 * gp[:-2] + 0.5 * gp[1:-1] + 0.25 * gp[2:]
+    med = float(np.median(g))
+    if not med > 0:
+        return segs
+    g = np.clip(g / med, *ENV_GAIN_LIMITS)
+    pos = (np.arange(n)[:, None] * slot + np.arange(sym)[None, :] + 0.5)
+    env = np.interp(pos.reshape(-1), cen, g).reshape(n, sym)
+    return segs / env
 
 
 def _values_from_coeffs(coeffs, cfg: Cfg, pre_rows: int):
@@ -1100,6 +1150,8 @@ def _mini_parse(raw: bytes):
     seglen = struct.unpack(">I", raw[9:13])[0]
     if seglen >= 10_000_000:
         return None
+    if raw[7] == 0 or raw[6] >= raw[7]:
+        return None            # impossible segment index/count (rev 8.1)
     flags = raw[8]
     return {"mode": mode, "version": raw[2],
             "session": struct.unpack(">H", raw[4:6])[0],
@@ -1387,8 +1439,8 @@ def _seg0_check(x, sec_start: int, mini, chan=None) -> bool:
         return False
 
 
-def _refine_start(x, off: int, mini, mini_cfg, full_cfg=None,
-                  col_idx=None, chan=None):
+def _refine_start_checked(x, off: int, mini, mini_cfg, full_cfg=None,
+                          col_idx=None, chan=None):
     """Refine a burst start against segment 0's own full
     decode. The sounding-correlation peak is blunt under babble
     and the mini soft score peaks at wrong offsets (measured on
@@ -1398,7 +1450,8 @@ def _refine_start(x, off: int, mini, mini_cfg, full_cfg=None,
     segment 0 fully decodes, and take the plateau centre. A
     constant start error persists through the whole segment
     chain, so this one refinement serves every segment.
-    Returns (start, mini)."""
+    Returns (start, mini, verified): verified is True when
+    segment 0's payload fully decoded somewhere in the scan."""
     mini_len = _mini_len(mini_cfg)
     good = []
     for delta in range(-64, 65, 4):
@@ -1408,21 +1461,29 @@ def _refine_start(x, off: int, mini, mini_cfg, full_cfg=None,
         if _seg0_check(x, cand + SND_LEN + mini_len, mini, chan):
             good.append(delta)
     if not good:
-        return off, mini
+        return off, mini, False
     delta = good[len(good) // 2]
     if delta == 0:
-        return off, mini
+        return off, mini, True
     m2 = _mini_decode(x, off + delta + SND_LEN, mini_cfg, full_cfg,
                       col_idx)
     if m2 is None or m2["index"] != 0:
-        return off, mini
-    return off + delta, m2
+        return off, mini, True
+    return off + delta, m2, True
 
 
-def _find_burst(samples, mini_cfg=_mini_cfg, full_cfg=None, col_idx=None):
-    """Returns (start, mini_dict) for segment 0. Tries the
-    mini-header at each ranked candidate until one validates —
-    a burst that cannot announce its mode fails loudly."""
+def _refine_start(x, off: int, mini, mini_cfg, full_cfg=None,
+                  col_idx=None, chan=None):
+    """(start, mini) — see _refine_start_checked."""
+    return _refine_start_checked(x, off, mini, mini_cfg, full_cfg,
+                                 col_idx, chan)[:2]
+
+
+def _find_burst_legacy(samples, mini_cfg=_mini_cfg, full_cfg=None,
+                       col_idx=None):
+    """The NDAP-8 8.0 finder: energy-onset candidates refined by
+    the sounding's phase-1 pattern, validated by the mini-header.
+    Kept as the fallback behind the correlation finder."""
     x = np.asarray(samples, dtype=float)
     for off in _refined_candidates(x):
         mini = _mini_decode(x, off + SND_LEN, mini_cfg, full_cfg, col_idx)
@@ -1430,6 +1491,118 @@ def _find_burst(samples, mini_cfg=_mini_cfg, full_cfg=None, col_idx=None):
             return _refine_start(x, off, mini, mini_cfg, full_cfg,
                                  col_idx)
     raise ValueError("no NDAP-8 burst found (mini-header unrecoverable)")
+
+
+# --- correlation acquisition (NDAP-8 rev 8.1; the idea — sync by
+# normalized cross-correlation with an offset retry ladder — is
+# credited to NDAP-8-P's receiver; this version correlates against
+# the sounding NDAP-8 already transmits, so the on-air format is
+# unchanged).
+ACQ_PEAKS = 6                      # correlation peaks tried, best first
+ACQ_LADDER = (0, -8, 8, -16, 16, -32, 32, -64, 64, -128, 128, -240, 240)
+ACQ_MIN_NCC = 0.02                 # below this a "peak" is just noise
+_SND_REF = None
+
+
+def _snd_reference():
+    """The known sounding waveform, zero-mean and unit-norm (the
+    template for the normalized cross-correlation)."""
+    global _SND_REF
+    if _SND_REF is None:
+        r = _sounding_audio()
+        r = r - np.mean(r)
+        _SND_REF = r / np.linalg.norm(r)
+    return _SND_REF
+
+
+def _ncc_peaks(samples, n_peaks=ACQ_PEAKS):
+    """Normalized cross-correlation of the recording against the
+    sounding template: ncc[k] = <x[k:k+L], ref> / ||x[k:k+L]||
+    (the window mean is removed analytically). Returns up to
+    n_peaks (ncc, offset) pairs, strongest first, at least one
+    sounding-length apart."""
+    x = np.asarray(samples, dtype=float)
+    ref = _snd_reference()
+    L = len(ref)
+    if len(x) < L + MINI_LEN:
+        return []
+    n = 1 << int(np.ceil(np.log2(len(x) + L)))
+    c = np.fft.irfft(np.fft.rfft(x, n) * np.conj(np.fft.rfft(ref, n)), n)
+    c = c[:len(x) - L + 1]
+    cs = np.concatenate([[0.0], np.cumsum(x)])
+    cs2 = np.concatenate([[0.0], np.cumsum(x * x)])
+    s1 = cs[L:] - cs[:-L]
+    s2 = cs2[L:] - cs2[:-L]
+    var = np.maximum(s2 - s1 * s1 / L, 1e-12)   # ||x_w - mean||^2
+    ncc = c / np.sqrt(var)                       # ref has zero mean
+    # a burst must leave room for its mini-header after the sounding
+    last = len(x) - L - MINI_LEN
+    if last < 0:
+        return []
+    ncc = ncc[:last + 1]
+    out = []
+    order = np.argsort(ncc)[::-1]
+    for k in order:
+        if ncc[k] < ACQ_MIN_NCC or len(out) >= n_peaks:
+            break
+        if all(abs(int(k) - o) >= SND1_SYM for _, o in out):
+            out.append((float(ncc[k]), int(k)))
+    return out
+
+
+def _find_burst_xcorr(samples, mini_cfg=_mini_cfg, full_cfg=None,
+                      col_idx=None):
+    """Primary acquisition: correlation peaks, each tried at the
+    ladder of small offsets. A mini-header validating is necessary
+    but not sufficient — it tolerates start errors of 100+ samples
+    that the payload does not — so each validating offset is
+    refined against segment 0's own payload decode, and the ladder
+    continues past offsets whose refinement window (+-64) is
+    already covered until one verifies. If none verifies (the
+    payload is lost in noise), the first validating candidate is
+    returned so the caller can still report per-segment results.
+    Work is bounded: ACQ_PEAKS x len(ACQ_LADDER) mini-header
+    decodes and at most five refinement scans per peak."""
+    x = np.asarray(samples, dtype=float)
+    fallback = None
+    for _, peak in _ncc_peaks(x):
+        scanned = []
+        for d in ACQ_LADDER:
+            off = peak + d
+            if off < 0 or off + SND_LEN + _mini_len(mini_cfg) > len(x):
+                continue
+            if any(abs(off - o) <= 56 for o in scanned):
+                continue             # inside an already-scanned window
+            mini = _mini_decode(x, off + SND_LEN, mini_cfg, full_cfg,
+                                col_idx)
+            if mini is None or mini["index"] != 0:
+                continue
+            scanned.append(off)
+            st, m2, verified = _refine_start_checked(
+                x, off, mini, mini_cfg, full_cfg, col_idx)
+            if verified:
+                return st, m2
+            if fallback is None:
+                fallback = (st, m2)
+    if fallback is not None:
+        return fallback
+    raise ValueError("no NDAP-8 burst found (correlation acquisition)")
+
+
+def _find_burst(samples, mini_cfg=_mini_cfg, full_cfg=None, col_idx=None,
+                method="auto"):
+    """Returns (start, mini_dict) for segment 0. method 'xcorr'
+    tries only the correlation finder, 'legacy' only the 8.0
+    finder, 'auto' (default) correlation first, then the legacy
+    finder. A burst that cannot announce its mode fails loudly."""
+    if method == "legacy":
+        return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx)
+    try:
+        return _find_burst_xcorr(samples, mini_cfg, full_cfg, col_idx)
+    except ValueError:
+        if method == "xcorr":
+            raise
+    return _find_burst_legacy(samples, mini_cfg, full_cfg, col_idx)
 
 
 # ------------------------------------------------------------ segmentation
@@ -1606,6 +1779,23 @@ def encode_auto(data: bytes, sounding_samples):
     return encode_adaptive(data, mode, analysis=ana), mode
 
 
+def _decode_attempt(x, start, norm: bool):
+    """One full decode try at a fixed start: validate segment 0's
+    mini-header, walk the chain. norm: divide the slow envelope out
+    (see _divide_envelope)."""
+    tok = _ENV_NORM.set(norm)
+    try:
+        mini0 = _mini_decode(x, start + SND_LEN)
+        if mini0 is None or mini0["index"] != 0:
+            raise ValueError("mini-header unrecoverable at given start")
+        rep = _walk_segments(x, start, mini0)
+        rep["start"] = start
+        rep["envelope_normalized"] = norm
+        return rep
+    finally:
+        _ENV_NORM.reset(tok)
+
+
 def decode_adaptive_report(samples, start=None,
                            house_secret: bytes = None) -> dict:
     """Full decode with a per-segment report. If house_secret is
@@ -1613,15 +1803,47 @@ def decode_adaptive_report(samples, start=None,
     'house_token_ok' says whether the token verifies against
     the reassembled payload's CRC-32. Verification is reported,
     never required: a burst decodes identically with no secret,
-    a wrong secret, or no token."""
+    a wrong secret, or no token.
+
+    Receiver flow (rev 8.1), every step CRC-gated, first full
+    success wins: (1) correlation acquisition, raw samples;
+    (2) the same start with the slow envelope divided out;
+    (3)-(4) the same two steps from the 8.0 onset/sounding
+    finder, if it lands on a different start. If nothing fully
+    decodes, the attempt with the most good segments is reported
+    (ok=False) — never wrong bytes. The report adds 'start',
+    'acquisition' ('xcorr' | 'legacy' | 'given') and
+    'envelope_normalized'."""
     x = np.asarray(samples, dtype=float)
-    if start is None:
-        start, mini0 = _find_burst(x)
-    else:
-        mini0 = _mini_decode(x, start + SND_LEN)
-        if mini0 is None or mini0["index"] != 0:
-            raise ValueError("mini-header unrecoverable at given start")
-    rep = _walk_segments(x, start, mini0)
+    methods = ["xcorr", "legacy"] if start is None else [None]
+    best, first_err, seen = None, None, set()
+    for method in methods:
+        try:
+            st = start if method is None else _find_burst(x, method=method)[0]
+        except ValueError as e:
+            first_err = first_err or e
+            continue
+        for norm in (False, True):
+            if (st, norm) in seen:
+                continue
+            seen.add((st, norm))
+            try:
+                rep = _decode_attempt(x, st, norm)
+            except ValueError as e:
+                first_err = first_err or e
+                continue
+            rep["acquisition"] = method or "given"
+            if rep["ok"]:
+                best = rep
+                break
+            if best is None or len(rep["ok_segments"]) > \
+                    len(best["ok_segments"]):
+                best = rep
+        if best is not None and best["ok"]:
+            break
+    if best is None:
+        raise first_err
+    rep = best
     if rep["ok"] and house_secret is not None and rep["house_token"]:
         expect = house_token(rep["session"],
                              zlib.crc32(rep["data"]) & 0xFFFFFFFF,
@@ -1643,6 +1865,97 @@ def decode_adaptive(samples, start=None) -> bytes:
 decode_auto = decode_adaptive
 encode_fast = encode_adaptive
 decode_fast = decode_adaptive
+
+
+# ------------------------------------------------------- expression layer
+# Optional, sender-side, data-free (SPEC §19). Character lives in
+# the layers that carry no data: a short whistle phrase BEFORE and
+# AFTER the burst, and a gentle amplitude contour over it. The
+# burst's own frequencies and timing are never touched — NDAP's data
+# is differential phase over 5 ms symbols, so any common pitch glide
+# or time warp of the burst destroys it (measured: every depth from
+# 0.3 % to 1.0 % failed), while bookends and amplitude prosody
+# decode byte-exact and score identically to a plain burst.
+EXPR_PRE = ((660.0, 880.0, 0.14), (880.0, 1175.0, 0.16))    # rising "ready"
+EXPR_POST = ((1175.0, 880.0, 0.14), (880.0, 587.0, 0.20))   # falling "done"
+EXPR_LIMITS = {
+    "prosody_depth_max": 0.40,     # gain never below 1 - depth (>= 0.60)
+    "prosody_hz_max": 8.0,         # slow: phrase/word-scale, not tremolo
+    "phrase_freq_hz": (200.0, 4000.0),
+    "phrase_max_s": 1.5,           # each bookend
+    "gap_min_s": 0.10,             # silence between bookend and burst
+    "gap_max_s": 1.0,
+    "bookend_level_max": 0.85,     # of the burst's own peak
+}
+
+
+def _whistle(phrase, level: float) -> np.ndarray:
+    """phrase: iterable of (f_start_hz, f_end_hz, seconds) glides,
+    phase-continuous, each note faded in/out over 12 ms."""
+    out, ph = [], 0.0
+    for f0, f1, dur in phrase:
+        n = int(round(dur * SR))
+        if n <= 0:
+            continue
+        f = np.linspace(f0, f1, n)
+        phase = ph + 2 * np.pi * np.cumsum(f) / SR
+        ph = float(phase[-1]) % (2 * np.pi)
+        note = np.sin(phase)
+        k = min(n // 2, int(0.012 * SR))
+        if k > 0:
+            ramp = 0.5 - 0.5 * np.cos(np.pi * np.arange(k) / k)
+            note[:k] *= ramp
+            note[-k:] *= ramp[::-1]
+        out.append(note)
+    return level * np.concatenate(out) if out else np.zeros(0)
+
+
+def add_expression(samples, bookends: bool = True, pre=EXPR_PRE,
+                   post=EXPR_POST, prosody_depth: float = 0.25,
+                   prosody_hz: float = 2.0, prosody_phase: float = 0.0,
+                   gap_s: float = 0.15, bookend_level: float = 0.6):
+    """Wrap an encoded burst in the optional Expression Layer.
+
+    - amplitude prosody: the burst is multiplied by the slow gain
+      1 - depth*(0.5 - 0.5*cos(2*pi*hz*t + phase)); gain stays in
+      [1 - depth, 1] (never above 1, so peak level is preserved).
+    - bookends: `pre` whistled before the burst, `post` after, each
+      separated from it by `gap_s` of silence; levels are relative
+      to the burst's peak.
+    There is deliberately NO parameter that warps the burst's
+    frequency or time base — that is prohibited (SPEC §19).
+    Returns a new array; the input burst's samples are only scaled.
+    Any compliant NDAP-8 decoder (8.0 or later) decodes the result
+    byte-exact."""
+    L = EXPR_LIMITS
+    if not 0.0 <= prosody_depth <= L["prosody_depth_max"]:
+        raise ValueError("prosody_depth outside the Expression Layer limit")
+    if not 0.0 <= prosody_hz <= L["prosody_hz_max"]:
+        raise ValueError("prosody_hz outside the Expression Layer limit")
+    if not L["gap_min_s"] <= gap_s <= L["gap_max_s"]:
+        raise ValueError("gap_s outside the Expression Layer limit")
+    if not 0.0 <= bookend_level <= L["bookend_level_max"]:
+        raise ValueError("bookend_level outside the Expression Layer limit")
+    x = np.asarray(samples, dtype=float)
+    t = np.arange(len(x)) / SR
+    gain = 1.0 - prosody_depth * (0.5 - 0.5 * np.cos(
+        2 * np.pi * prosody_hz * t + prosody_phase))
+    body = x * gain
+    if not bookends:
+        return body
+    lo, hi = L["phrase_freq_hz"]
+    peak = float(np.max(np.abs(x))) if len(x) else 1.0
+    parts = []
+    for phrase in (pre, post):
+        total = sum(d for _, _, d in phrase)
+        if total > L["phrase_max_s"] or any(
+                not (lo <= f <= hi) for f0, f1, _ in phrase
+                for f in (f0, f1)):
+            raise ValueError("bookend phrase outside the Expression "
+                             "Layer limits")
+        parts.append(_whistle(phrase, bookend_level * peak))
+    gap = np.zeros(int(round(gap_s * SR)))
+    return np.concatenate([parts[0], gap, body, gap, parts[1]])
 
 
 # ------------------------------------------------------------ duplex
