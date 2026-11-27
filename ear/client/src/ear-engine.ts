@@ -14,8 +14,21 @@
 //     matches one we just sent is also treated as our own echo;
 //   * listen-before-talk: playback waits for a quiet channel;
 //   * duplicates delivered once (session ID + payload CRC, checked
-//     here and again server-side);
-//   * screen Wake Lock while live.
+//     here and again server-side), with an expiry window so a peer
+//     re-sending the same short text later is not swallowed forever;
+//   * screen Wake Lock while live, re-acquired by the engine itself
+//     when the system releases it.
+//
+// Hardening (2026-11-26, before the first exchange):
+//   * one transmission lock: ping, sounding and speech are serialized
+//     through a single playback chain, so two sounds can never start
+//     over each other regardless of which caller asks first;
+//   * stop() halts a burst that is already playing (it stops the
+//     actual buffer source), not just future playback;
+//   * listen-before-talk backs off and retries with jitter instead of
+//     talking over a busy channel after a fixed deadline; a ping that
+//     cannot find a clear channel is skipped, and a message that
+//     cannot is reported as an error so it stays queued.
 
 import {
 analyze_channel,
@@ -43,6 +56,10 @@ export interface EarCallbacks {
   onFailed: (note: string, mode: string | null) => void;
   onLevel: (rms: number) => void;
   onNote: (note: string) => void;
+  /** The peer was heard just now: a decoded message, a real burst
+   *  that failed to decode, or the peer's heartbeat sounding found in
+   *  the room. Fires repeatedly while the peer is present. */
+  onPeerActivity: () => void;
 }
 
 const RING_SECONDS = 15;
@@ -50,6 +67,7 @@ const GUARD_TAIL_SECONDS = 1;
 const DETECT_EVERY_MS = 800;
 const MIN_WINDOW_SECONDS = 2.5;
 const MAX_WINDOW_SECONDS = 14;
+const SEEN_WINDOW_MS = 10 * 60 * 1000;
 
 function resample(samples: Float32Array, from: number, to: number): Float32Array {
   if (from === to) return samples;
@@ -83,6 +101,7 @@ export class EarEngine {
 
   private state: EarState = "idle";
   private detectTimer: number | null = null;
+  private presenceTimer: number | null = null;
   private decoding = false;
   private lastAttemptAt = 0;
   private cooldownUntil = 0;
@@ -91,9 +110,13 @@ export class EarEngine {
   private lastFailedAt = 0;
   private ownPlays: Array<{ start: number; end: number }> = [];
   private recentSent: Array<{ crc: number; at: number }> = [];
-  private seen = new Set<string>();
+  private seen = new Map<string, number>();
+
+  private playChain: Promise<void> = Promise.resolve();
+  private currentSource: AudioBufferSourceNode | null = null;
 
   private wakeLock: WakeLockSentinel | null = null;
+  private wakeLockWanted = false;
   private lastLevelAt = 0;
 
   soundingSamples: Float32Array | null = null;
@@ -160,6 +183,10 @@ export class EarEngine {
     this.detectTimer = window.setInterval(() => {
       void this.detectTick();
     }, DETECT_EVERY_MS);
+    this.presenceTimer = window.setInterval(() => {
+      this.presenceTick();
+    }, 4000);
+    this.wakeLockWanted = true;
     await this.requestWakeLock();
     return {
       sampleRate: this.captureRate,
@@ -172,6 +199,21 @@ export class EarEngine {
       window.clearInterval(this.detectTimer);
       this.detectTimer = null;
     }
+    if (this.presenceTimer !== null) {
+      window.clearInterval(this.presenceTimer);
+      this.presenceTimer = null;
+    }
+    // Halt a burst that is already playing — stopping must be able to
+    // silence the speaker, not just prevent future sounds.
+    if (this.currentSource) {
+      try {
+        this.currentSource.stop();
+      } catch {
+        // already ended
+      }
+      this.currentSource = null;
+    }
+    this.wakeLockWanted = false;
     try {
       this.processor?.disconnect();
       this.source?.disconnect();
@@ -198,7 +240,22 @@ export class EarEngine {
   private async requestWakeLock(): Promise<void> {
     try {
       if ("wakeLock" in navigator) {
-        this.wakeLock = await navigator.wakeLock.request("screen");
+        const lock = await navigator.wakeLock.request("screen");
+        this.wakeLock = lock;
+        // The system releases the lock on its own (tab hidden, battery
+        // saver, …). If the session is still live and the page is back
+        // in view, take it again instead of letting the screen sleep
+        // mid-session.
+        lock.addEventListener("release", () => {
+          if (this.wakeLock === lock) this.wakeLock = null;
+          if (
+            this.wakeLockWanted &&
+            this.state !== "idle" &&
+            document.visibilityState === "visible"
+          ) {
+            void this.requestWakeLock();
+          }
+        });
       }
     } catch {
       this.wakeLock = null;
@@ -287,9 +344,22 @@ export class EarEngine {
           this.recentSent.some(
             (s) => s.crc === crc && Date.now() - s.at < 90_000,
           );
-        if (!this.seen.has(key)) {
-          this.seen.add(key);
+        // Dedupe with an expiry window (mirrors the server's): the
+        // same burst re-scanned from the ring buffer is one message,
+        // but the same text arriving again minutes later is a new one.
+        const seenAt = this.seen.get(key);
+        const isDupe =
+          seenAt !== undefined && Date.now() - seenAt < SEEN_WINDOW_MS;
+        if (!isDupe) {
+          this.seen.set(key, Date.now());
+          if (this.seen.size > 200) {
+            const cutoff = Date.now() - SEEN_WINDOW_MS;
+            for (const [k, t] of this.seen) {
+              if (t < cutoff) this.seen.delete(k);
+            }
+          }
           if (!selfEcho && text.trim().length > 0) {
+            this.cb.onPeerActivity();
             this.cb.onHeard({
               text,
               mode: report.mode,
@@ -309,6 +379,7 @@ export class EarEngine {
         if (!isRepeat && !this.windowOverlapsOwnPlay(startAbs, endAbs)) {
           this.lastFailedKey = failKey;
           this.lastFailedAt = Date.now();
+          this.cb.onPeerActivity();
           this.cb.onFailed(
             `A burst was heard but could not be read (${report.error}).`,
             report.mode,
@@ -324,6 +395,41 @@ export class EarEngine {
     }
   }
 
+  /**
+   * Peer-presence check: look for the other phone's heartbeat in the
+   * recent capture. The heartbeat IS a sounding burst, and
+   * analyze_channel finds a sounding when one is in the window (and
+   * reports a degenerate analysis when none is). A window that
+   * overlaps our own playback is skipped — our own sounding is not
+   * the peer.
+   */
+  private presenceTick(): void {
+    if (this.state !== "listening" || this.decoding) return;
+    const filled = Math.min(this.totalWritten / SR, RING_SECONDS);
+    if (filled < 4.5) return;
+    const { data, startAbs } = this.snapshot(4.5);
+    const endAbs = startAbs + data.length;
+    if (this.windowOverlapsOwnPlay(startAbs, endAbs)) return;
+    let peak = 0;
+    for (let i = 0; i < data.length; i++) {
+      const a = Math.abs(data[i] ?? 0);
+      if (a > peak) peak = a;
+    }
+    if (peak < 0.03) return;
+    try {
+      const ana = analyze_channel(data);
+      if (
+        !ana.degenerate &&
+        Number.isFinite(ana.A.median_snr_db) &&
+        ana.A.median_snr_db > 3
+      ) {
+        this.cb.onPeerActivity();
+      }
+    } catch {
+      // No sounding in this window — the peer is not (yet) here.
+    }
+  }
+
   /** RMS of the most recent fraction of a second of capture. */
   private recentRms(seconds: number): number {
     const { data } = this.snapshot(seconds);
@@ -336,17 +442,44 @@ export class EarEngine {
     return Math.sqrt(sum / data.length);
   }
 
-  /** Listen-before-talk: wait for a quiet channel before playing. */
-  private async waitForClearChannel(): Promise<void> {
-    const deadline = Date.now() + 5000;
-    while (Date.now() < deadline) {
-      if (this.state === "idle") return;
-      if (this.recentRms(0.4) < 0.02) return;
-      await new Promise((r) => setTimeout(r, 350));
+  /**
+   * Listen-before-talk: wait for a quiet channel before playing.
+   * Returns true once the channel is clear. If it stays busy, back
+   * off with jitter and retry rather than talking over the other
+   * side; returns false only when the session stopped or the channel
+   * never cleared — the caller then skips (ping) or fails (message)
+   * instead of playing into a collision.
+   */
+  private async waitForClearChannel(): Promise<boolean> {
+    const roundBudgetsMs = [5000, 6000, 9000];
+    for (const budget of roundBudgetsMs) {
+      const deadline = Date.now() + budget;
+      while (Date.now() < deadline) {
+        if (this.state === "idle") return false;
+        if (this.recentRms(0.4) < 0.02) return true;
+        await new Promise((r) => setTimeout(r, 350));
+      }
+      // Jittered pause between rounds so two waiting phones do not
+      // fall into step and both decide the channel is clear together.
+      await new Promise((r) =>
+        setTimeout(r, 400 + Math.floor(Math.random() * 800)),
+      );
     }
+    return this.state !== "idle" && this.recentRms(0.4) < 0.02;
   }
 
-  private async playSamples(samples48: ArrayLike<number>): Promise<void> {
+  /**
+   * The single transmission lock: every sound the Ear makes goes
+   * through this chain, so a ping, a sounding and a message can never
+   * overlap no matter which caller asks first.
+   */
+  private playSamples(samples48: ArrayLike<number>): Promise<void> {
+    const run = this.playChain.then(() => this.playSamplesNow(samples48));
+    this.playChain = run.catch(() => {});
+    return run;
+  }
+
+  private async playSamplesNow(samples48: ArrayLike<number>): Promise<void> {
     if (!this.ctx) throw new Error("audio not started");
     if (this.ctx.state === "suspended") await this.ctx.resume();
     const atCtx = resample(Float32Array.from(samples48), SR, this.ctx.sampleRate);
@@ -355,6 +488,7 @@ export class EarEngine {
     const src = this.ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(this.ctx.destination);
+    this.currentSource = src;
     const playStartAbs = this.totalWritten;
     const prevState = this.state;
     this.setState("playing");
@@ -362,10 +496,13 @@ export class EarEngine {
       src.onended = () => resolve();
       src.start();
     });
+    if (this.currentSource === src) this.currentSource = null;
     const playEndAbs = this.totalWritten + Math.floor(GUARD_TAIL_SECONDS * SR);
     this.ownPlays.push({ start: playStartAbs, end: playEndAbs });
     if (this.ownPlays.length > 12) this.ownPlays.shift();
-    if (this.state === "playing") {
+    // If stop() tore the session down while this burst was playing,
+    // stay idle — never resurrect "listening" over a closed engine.
+    if (this.state === "playing" && this.stream) {
       this.setState(prevState === "playing" ? "listening" : prevState);
     }
   }
@@ -375,7 +512,10 @@ export class EarEngine {
     if (!this.ctx || this.state === "idle") {
       throw new Error("Start the session first — the ear needs the microphone to hear the room.");
     }
-    await this.waitForClearChannel();
+    const clear = await this.waitForClearChannel();
+    if (!clear) {
+      throw new Error("The channel stayed busy — the room could not be measured. Try again.");
+    }
     const burst = sounding_burst();
     const startAbs = this.totalWritten - Math.floor(0.25 * SR);
     await this.playSamples(new Float32Array(burst));
@@ -402,7 +542,11 @@ export class EarEngine {
     if (!this.ctx || this.state === "idle") {
       throw new Error("Begin listening first — ping needs the session open.");
     }
-    await this.waitForClearChannel();
+    // A heartbeat that cannot find a clear channel is simply skipped:
+    // talking over the peer to announce presence would defeat it. The
+    // next beat (1–3 s later) tries again.
+    const clear = await this.waitForClearChannel();
+    if (!clear) return;
     const burst = sounding_burst();
     const startAbs = this.totalWritten - Math.floor(0.25 * SR);
     await this.playSamples(new Float32Array(burst));
@@ -442,7 +586,12 @@ export class EarEngine {
     }
     this.recentSent.push({ crc: crc32(data), at: Date.now() });
     if (this.recentSent.length > 20) this.recentSent.shift();
-    await this.waitForClearChannel();
+    // Never talk over the peer: if the channel never clears, fail —
+    // the caller leaves the text queued instead of marking it spoken.
+    const clear = await this.waitForClearChannel();
+    if (!clear) {
+      throw new Error("The channel stayed busy, so the message was not sent.");
+    }
     await this.playSamples(samples);
     return mode;
   }

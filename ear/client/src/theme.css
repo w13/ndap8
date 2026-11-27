@@ -31,6 +31,8 @@
   --dim: #8a94a0;
   --border: #2e3742;
   --accent: #2dd4bf;
+  --connected: #4ade80;
+  --arrival: #fbbf24;
   --amber: #f59e0b;
   --danger: #f87171;
   --radius: 12px;
@@ -50,6 +52,8 @@
     --dim: #5c6670;
     --border: #cbd3da;
     --accent: #0f766e;
+    --connected: #16a34a;
+    --arrival: #d97706;
     --amber: #b45309;
     --danger: #b91c1c;
   }
@@ -59,5 +63,160 @@
 @layer base {
   button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
     min-height: 2rem;
+  }
+}
+
+/* Listening indication — colour and motion only, no words. While the
+   microphone is live the toggle breathes with a soft glow in the
+   listening colour; when the peer's heartbeat has been heard the glow
+   (and the toggle track, set inline) shifts to the connected colour.
+   Both classes are removed the moment the toggle goes off. */
+@keyframes ear-breathe {
+  0%, 100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--accent) 40%, transparent),
+      0 0 22px 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 12px color-mix(in srgb, var(--accent) 0%, transparent),
+      0 0 46px 12px color-mix(in srgb, var(--accent) 50%, transparent);
+  }
+}
+
+@keyframes ear-breathe-connected {
+  0%, 100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--connected) 45%, transparent),
+      0 0 22px 2px color-mix(in srgb, var(--connected) 35%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 12px color-mix(in srgb, var(--connected) 0%, transparent),
+      0 0 46px 12px color-mix(in srgb, var(--connected) 55%, transparent);
+  }
+}
+
+.ear-listening {
+  animation: ear-breathe 2.6s ease-in-out infinite;
+}
+
+.ear-connected {
+  animation: ear-breathe-connected 2.6s ease-in-out infinite;
+}
+
+/* Message arrival — a third colour (--arrival), used for nothing
+   else. On arrival the toggle flares: a bright, wide pulse meant to
+   be noticed across the room. While a decoded message is still
+   waiting undelivered in the inbox, the flare settles into a slow,
+   subtle amber breathing (ear-arrival-waiting) that lasts until the
+   agent fetches the message. */
+@keyframes ear-arrival-flare {
+  0%, 100% {
+    box-shadow:
+      0 0 0 0 color-mix(in srgb, var(--arrival) 75%, transparent),
+      0 0 34px 8px color-mix(in srgb, var(--arrival) 60%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 30px color-mix(in srgb, var(--arrival) 0%, transparent),
+      0 0 120px 44px color-mix(in srgb, var(--arrival) 85%, transparent);
+  }
+}
+
+@keyframes ear-arrival-wait {
+  0%, 100% {
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--arrival) 65%, transparent),
+      0 0 18px 2px color-mix(in srgb, var(--arrival) 30%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--arrival) 85%, transparent),
+      0 0 30px 6px color-mix(in srgb, var(--arrival) 45%, transparent);
+  }
+}
+
+.ear-arrival {
+  animation: ear-arrival-flare 1.2s ease-in-out 4;
+}
+
+/* Radiating rings — while listening, two toggle-shaped rings are
+   born at the toggle's edge and expand outward, fading as they go,
+   staggered so one is always mid-flight. They carry the same state
+   colour as the toggle (--ear-state, set by the page), so listening,
+   connected and arrival all ripple in their own colour. They exist
+   only while the toggle is on; off removes them outright. */
+@keyframes ear-ripple {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(1.55);
+    opacity: 0;
+  }
+}
+
+.ear-ripple {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 11rem;
+  height: 6rem;
+  border-radius: 9999px;
+  border: 2px solid var(--ear-state, var(--accent));
+  animation: ear-ripple 2.6s ease-out infinite;
+  pointer-events: none;
+}
+
+.ear-ripple-late {
+  animation-delay: 1.3s;
+}
+
+/* Level halo — a soft field of the state colour behind the toggle
+   whose size and opacity the page drives from the microphone's live
+   level: it swells when the mic hears sound and settles when the
+   room is quiet, so "listening" is visible as a reaction, not just
+   a state. The short transition smooths the engine's ~5 Hz level
+   updates into continuous motion. */
+.ear-halo {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 11rem;
+  height: 6rem;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--ear-state, var(--accent)) 45%, transparent);
+  filter: blur(22px);
+  transition: transform 180ms linear, opacity 180ms linear;
+  pointer-events: none;
+}
+
+.ear-arrival-waiting {
+  animation: ear-arrival-wait 3.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ear-listening, .ear-connected, .ear-arrival, .ear-arrival-waiting, .ear-ripple {
+    animation: none;
+  }
+  .ear-ripple {
+    opacity: 0.35;
+  }
+  .ear-ripple-late {
+    display: none;
+  }
+  .ear-halo {
+    transition: none;
+  }
+  .ear-listening {
+    box-shadow: 0 0 0 3px var(--accent), 0 0 26px 4px color-mix(in srgb, var(--accent) 40%, transparent);
+  }
+  .ear-connected {
+    box-shadow: 0 0 0 3px var(--connected), 0 0 26px 4px color-mix(in srgb, var(--connected) 45%, transparent);
+  }
+  .ear-arrival, .ear-arrival-waiting {
+    box-shadow: 0 0 0 4px var(--arrival), 0 0 34px 8px color-mix(in srgb, var(--arrival) 55%, transparent);
   }
 }
