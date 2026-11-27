@@ -1,31 +1,5 @@
-# The Ear
-
-A Muse Space that lets two agents converse over the air with NDAP-8: the
-phone in each house runs this page, encodes queued text to tone bursts,
-decodes what it hears, and exposes the exchange to its agent as state
-(`get_state`, `queue_message`, `get_inbox`, `set_session`).
-
-The page is one toggle switch and nothing else — no title, no captions, no
-text at all; the knob carries no lettering. State shows in colour and
-motion only: teal breathing while listening, green when the peer's
-heartbeat is heard, an amber flare when a message arrives. Toggled on, it
-listens and emits a small heartbeat burst at a random interval (the
-interval follows the burst's size; a tiny heartbeat beats every ~1–3 s).
-Two identical Ears in one room hear each other's heartbeats and are
-connected; the agents then begin at once and coordinate who speaks first
-out-of-band.
-
-Hardened before the first exchange: atomic inbox/outbox claiming (no
-double delivery, no double speaking), expiring dedupe, a single
-transmission lock, fail-closed listen-before-talk, queued texts expiring
-after 15 minutes, and a true listening heartbeat behind
-`get_state.listening`.
-
-First-session repair (Nov 26): only a live page may claim the outbox;
-decode scans are capped and duty-cycled so the page stays responsive;
-failed speaks retry promptly under a renewed claim (renew_claim) and the
-record step can never re-transmit; speech without a usable room sounding
-falls back to Mode B. Codec byte-untouched.
-
-Build a twin from this source as-is: identical code, identical Space.
-`client/src/ndap.js` is the same codec as `../js/src/ndap.js`, inlined.
+Gate repair (Nov 27): the clear-channel gate no longer starves speech —
+scanning pauses while a message is getting out, the gate samples ~3x
+finer and takes the first genuine gap between heartbeats, heartbeats
+yield to speech, a watchdog guards playback, and "sent" is recorded only
+once a burst is actually on the air.

@@ -45,6 +45,33 @@
 //     Mode B (strong Reed–Solomon, the robust profile) instead of
 //     Mode A (fast but fragile in a real room). The peer decodes any
 //     mode, so this is a purely local transmission choice.
+//
+// Second-exchange fix (2026-11-27, after a live page claimed a
+// message and held it unspoken for minutes while both phones kept
+// exchanging identical short heartbeat buzzes):
+//   * the clear-channel gate was the strangler. It sampled the last
+//     0.4 s of capture every 350 ms and demanded near-silence, while
+//     the peer's heartbeat — a loud 0.2 s burst every 1–3 s — poisons
+//     ~0.6 s of gate readings per burst; and the moment this phone
+//     went quiet to speak, the peer's own gate passed instantly, so
+//     the peer heartbeated at its maximum rate exactly while this
+//     phone was trying to talk. Worse, the decoder kept running its
+//     multi-second scans (plus a presence analysis every 4 s) on the
+//     same main thread throughout the wait — starving the mic
+//     callbacks the gate reads and the timers it polls with, so the
+//     gate kept reading stale, burst-poisoned audio and never saw
+//     the gaps that did exist. Now: while a message is trying to get
+//     out, decode scans and presence checks pause entirely, and the
+//     gate polls ~3× faster against a shorter quiet requirement, so
+//     the first real gap between heartbeats is used.
+//   * heartbeats yield to speech inside the engine, not just in the
+//     page: a ping that is waiting for its gap when a message starts
+//     trying stands down instead of winning the gap and re-poisoning
+//     the message's gate with our own burst.
+//   * playback can no longer wedge the transmission chain: if a
+//     burst's onended never arrives (a wedged audio context), a
+//     watchdog stops the source and settles the play, so the chain,
+//     the gate and the page's speaking flag all stay live.
 
 import {
 analyze_channel,
@@ -81,6 +108,9 @@ export interface EarCallbacks {
 const RING_SECONDS = 15;
 const GUARD_TAIL_SECONDS = 1;
 const DETECT_EVERY_MS = 800;
+// The channel reads as clear below this RMS. A heartbeat burst at
+// conversational distance sits far above it; a quiet room far below.
+const CLEAR_RMS = 0.02;
 const MIN_WINDOW_SECONDS = 2.5;
 // Scan only the recent seconds: a burst stays inside this window for
 // many consecutive attempts, and a shorter window is far cheaper to
@@ -135,6 +165,12 @@ export class EarEngine {
 
   private playChain: Promise<void> = Promise.resolve();
   private currentSource: AudioBufferSourceNode | null = null;
+  // True while a message is trying to get out (gate wait + playback).
+  // Decode scans and presence checks pause for its whole duration so
+  // the gate's timers and mic callbacks run in real time, and
+  // heartbeats stand down so our own ping cannot take the gap the
+  // message is waiting for.
+  private speechActive = false;
 
   private wakeLock: WakeLockSentinel | null = null;
   private wakeLockWanted = false;
@@ -333,6 +369,10 @@ export class EarEngine {
 
   private async detectTick(): Promise<void> {
     if (this.state !== "listening" || this.decoding) return;
+    // A message trying to get out owns the thread: scanning now
+    // would starve the clear-channel gate that decides whether the
+    // message may play (the second-exchange failure).
+    if (this.speechActive) return;
     const now = performance.now();
     if (now < this.cooldownUntil) return;
     if (now - this.lastAttemptAt < this.attemptGapMs) return;
@@ -432,6 +472,7 @@ export class EarEngine {
    */
   private presenceTick(): void {
     if (this.state !== "listening" || this.decoding) return;
+    if (this.speechActive) return;
     const filled = Math.min(this.totalWritten / SR, RING_SECONDS);
     if (filled < 4.5) return;
     const { data, startAbs } = this.snapshot(4.5);
@@ -471,28 +512,38 @@ export class EarEngine {
 
   /**
    * Listen-before-talk: wait for a quiet channel before playing.
-   * Returns true once the channel is clear. If it stays busy, back
-   * off with jitter and retry rather than talking over the other
-   * side; returns false only when the session stopped or the channel
-   * never cleared — the caller then skips (ping) or fails (message)
-   * instead of playing into a collision.
+   * The channel counts as clear once the most recent fraction of a
+   * second has stayed below CLEAR_RMS for `quietMs` of consecutive
+   * polling. Polls run every ~120 ms against a 0.25 s window — much
+   * finer than the gate this replaces (0.4 s every 350 ms), which
+   * kept missing the real gaps between the peer's heartbeats: each
+   * 0.2 s heartbeat burst poisoned ~0.6 s of its readings, and with
+   * the decoder saturating the thread its samples went stale besides.
+   * A heartbeat-spaced channel has a second or more of quiet between
+   * bursts, so the finer gate finds a gap within a beat or two; a
+   * genuinely busy channel (a voice, a message in flight) stays
+   * above the threshold and is never talked over. Returns false only
+   * when the session stopped or the budget ran out — the caller then
+   * skips (ping) or fails (message) instead of playing into a
+   * collision.
    */
-  private async waitForClearChannel(): Promise<boolean> {
-    const roundBudgetsMs = [5000, 6000, 9000];
-    for (const budget of roundBudgetsMs) {
-      const deadline = Date.now() + budget;
-      while (Date.now() < deadline) {
-        if (this.state === "idle") return false;
-        if (this.recentRms(0.4) < 0.02) return true;
-        await new Promise((r) => setTimeout(r, 350));
+  private async waitForClearChannel(opts: {
+    budgetMs: number;
+    quietMs: number;
+  }): Promise<boolean> {
+    const deadline = Date.now() + opts.budgetMs;
+    let quietSince: number | null = null;
+    while (Date.now() < deadline) {
+      if (this.state === "idle") return false;
+      if (this.recentRms(0.25) < CLEAR_RMS) {
+        if (quietSince === null) quietSince = Date.now();
+        if (Date.now() - quietSince >= opts.quietMs) return true;
+      } else {
+        quietSince = null;
       }
-      // Jittered pause between rounds so two waiting phones do not
-      // fall into step and both decide the channel is clear together.
-      await new Promise((r) =>
-        setTimeout(r, 400 + Math.floor(Math.random() * 800)),
-      );
+      await new Promise((r) => setTimeout(r, 120));
     }
-    return this.state !== "idle" && this.recentRms(0.4) < 0.02;
+    return this.state !== "idle" && this.recentRms(0.25) < CLEAR_RMS;
   }
 
   /**
@@ -519,10 +570,45 @@ export class EarEngine {
     const playStartAbs = this.totalWritten;
     const prevState = this.state;
     this.setState("playing");
+    // Playback must always settle. If the audio stack wedges and
+    // onended never arrives, an unguarded await would hang the
+    // transmission chain (and the page's speaking flag) forever —
+    // so a watchdog stops the source and settles the play a few
+    // seconds past the burst's real duration, and a start() that
+    // throws surfaces as an error instead of a silent hang.
+    let startError: unknown = null;
     await new Promise<void>((resolve) => {
-      src.onended = () => resolve();
-      src.start();
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(watchdog);
+        resolve();
+      };
+      const watchdog = window.setTimeout(
+        () => {
+          try {
+            src.stop();
+          } catch {
+            // already ended
+          }
+          finish();
+        },
+        buffer.duration * 1000 + 4000,
+      );
+      src.onended = finish;
+      try {
+        src.start();
+      } catch (e) {
+        startError = e;
+        finish();
+      }
     });
+    if (startError !== null) {
+      throw startError instanceof Error
+        ? startError
+        : new Error("playback failed to start");
+    }
     if (this.currentSource === src) this.currentSource = null;
     const playEndAbs = this.totalWritten + Math.floor(GUARD_TAIL_SECONDS * SR);
     this.ownPlays.push({ start: playStartAbs, end: playEndAbs });
@@ -539,7 +625,10 @@ export class EarEngine {
     if (!this.ctx || this.state === "idle") {
       throw new Error("Start the session first — the ear needs the microphone to hear the room.");
     }
-    const clear = await this.waitForClearChannel();
+    const clear = await this.waitForClearChannel({
+      budgetMs: 12000,
+      quietMs: 250,
+    });
     if (!clear) {
       throw new Error("The channel stayed busy — the room could not be measured. Try again.");
     }
@@ -569,11 +658,22 @@ export class EarEngine {
     if (!this.ctx || this.state === "idle") {
       throw new Error("Begin listening first — ping needs the session open.");
     }
+    // Speech outranks presence: while a message is trying to get
+    // out, a heartbeat stands down entirely — its burst would poison
+    // the message's clear-channel gate on our own microphone.
+    if (this.speechActive) return;
     // A heartbeat that cannot find a clear channel is simply skipped:
     // talking over the peer to announce presence would defeat it. The
-    // next beat (1–3 s later) tries again.
-    const clear = await this.waitForClearChannel();
+    // next beat (1–3 s later) tries again, so the budget stays short.
+    const clear = await this.waitForClearChannel({
+      budgetMs: 6000,
+      quietMs: 250,
+    });
     if (!clear) return;
+    // The gap this ping waited for may be the very gap a message
+    // that arrived mid-wait is counting on — check once more before
+    // taking it.
+    if (this.speechActive) return;
     const burst = sounding_burst();
     const startAbs = this.totalWritten - Math.floor(0.25 * SR);
     await this.playSamples(new Float32Array(burst));
@@ -614,15 +714,29 @@ export class EarEngine {
       samples = encode_adaptive(data, "B");
       mode = "B";
     }
-    this.recentSent.push({ crc: crc32(data), at: Date.now() });
-    if (this.recentSent.length > 20) this.recentSent.shift();
-    // Never talk over the peer: if the channel never clears, fail —
-    // the caller leaves the text queued instead of marking it spoken.
-    const clear = await this.waitForClearChannel();
-    if (!clear) {
-      throw new Error("The channel stayed busy, so the message was not sent.");
+    // From here to the end of playback this message owns the
+    // engine: decode scans and presence checks pause (so the gate
+    // below samples the room in real time instead of reading stale
+    // audio between multi-second scans) and heartbeats stand down.
+    this.speechActive = true;
+    try {
+      // Never talk over the peer: if the channel never clears, fail —
+      // the caller leaves the text queued instead of marking it spoken.
+      const clear = await this.waitForClearChannel({
+        budgetMs: 20000,
+        quietMs: 250,
+      });
+      if (!clear) {
+        throw new Error("The channel stayed busy, so the message was not sent.");
+      }
+      // Only a burst that is actually going on the air counts as
+      // sent for echo suppression.
+      this.recentSent.push({ crc: crc32(data), at: Date.now() });
+      if (this.recentSent.length > 20) this.recentSent.shift();
+      await this.playSamples(samples);
+      return mode;
+    } finally {
+      this.speechActive = false;
     }
-    await this.playSamples(samples);
-    return mode;
   }
 }
