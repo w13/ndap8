@@ -152,6 +152,15 @@ Regenerate the set (never hand-edit it) with:
 python3 ndap_conformance.py
 ```
 
+## JavaScript implementation
+
+The `js/` directory holds a complete second implementation: a
+single dependency-free ES module that runs in browsers, Workers
+and Node, byte-compatible with the Python implementation above —
+the two encode and decode each other exactly, pass the same
+conformance vectors, and are cross-checked against each other in
+both directions. See `js/README.md`.
+
 ## Honest limits
 
 - **Every number here is from a simulated harness.**

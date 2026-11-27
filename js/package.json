@@ -1,0 +1,10 @@
+{
+  "name": "ndap8-js",
+  "version": "1.0.0",
+  "description": "NDAP-8 JavaScript implementation — single ES module, zero dependencies",
+  "type": "module",
+  "main": "src/ndap.js",
+  "scripts": {
+    "test": "node test/conformance.mjs && node test/zlib-exact.mjs && node test/crosscheck.mjs"
+  }
+}
