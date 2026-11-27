@@ -21,5 +21,11 @@ transmission lock, fail-closed listen-before-talk, queued texts expiring
 after 15 minutes, and a true listening heartbeat behind
 `get_state.listening`.
 
+First-session repair (Nov 26): only a live page may claim the outbox;
+decode scans are capped and duty-cycled so the page stays responsive;
+failed speaks retry promptly under a renewed claim (renew_claim) and the
+record step can never re-transmit; speech without a usable room sounding
+falls back to Mode B. Codec byte-untouched.
+
 Build a twin from this source as-is: identical code, identical Space.
 `client/src/ndap.js` is the same codec as `../js/src/ndap.js`, inlined.

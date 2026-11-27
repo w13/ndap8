@@ -75,10 +75,18 @@ export function App() {
     refetchInterval: 2000,
   });
 
+  // Polling the outbox CLAIMS the next message server-side, so only
+  // a page that is actually live may poll: a page with the toggle off
+  // (a second tab, a preview, a leftover window) would otherwise
+  // claim the message, never speak it, and strand it for the whole
+  // claim-stale window — which is exactly how the first exchange
+  // died. The session state above is polled regardless, so arming
+  // still auto-starts this page, which then enables this query.
   const outbox = useQuery({
     queryKey: ["outbox"],
     queryFn: () => api.poll_outbox({}),
     refetchInterval: 2000,
+    enabled: live,
   });
 
   const peer = state.data?.peer ?? "";
@@ -199,18 +207,76 @@ export function App() {
     if (!live || !next || speakingRef.current) return;
     speakingRef.current = true;
     void (async () => {
-      try {
-        const mode = await engineRef.current!.speak(next.text);
-        await api.mark_spoken({ id: next.id, mode });
-        queryClient.invalidateQueries({ queryKey: ["state"] });
-        queryClient.invalidateQueries({ queryKey: ["outbox"] });
-      } catch (e) {
-        setError(
-          e instanceof Error ? e.message : "A message could not be spoken.",
-        );
-      } finally {
-        speakingRef.current = false;
+      // Two strictly separate phases. SPEAK: a failed attempt
+      // (usually: the channel never read as clear) is retried
+      // promptly — before each retry the page renews its claim, so
+      // the message stays exclusively ours for exactly as long as
+      // we are actively trying, and no other page can take it over
+      // mid-retries and speak it alongside us. If the claim can no
+      // longer be renewed, we stop rather than risk a double send.
+      // RECORD: once a speak has succeeded the text is on the air;
+      // a failed mark_spoken is retried on its own and can never
+      // loop back into speaking the text again. speakingRef stays
+      // true across both phases, which also keeps the heartbeat
+      // silent while a message is trying to get out.
+      let failure: unknown = null;
+      let spokenMode: string | null = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (!liveRef.current) break;
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, 2500));
+          if (!liveRef.current) break;
+          try {
+            const renewed = await api.renew_claim({ id: next.id });
+            if (!renewed.ok) {
+              failure = new Error(
+                "The message could not be sent — its claim was lost.",
+              );
+              break;
+            }
+          } catch {
+            failure = new Error(
+              "The message could not be sent — its claim could not be renewed.",
+            );
+            break;
+          }
+        }
+        try {
+          spokenMode = await engineRef.current!.speak(next.text);
+          failure = null;
+          break;
+        } catch (e) {
+          failure = e;
+        }
       }
+      if (spokenMode !== null) {
+        let recorded = false;
+        for (let i = 0; i < 3 && !recorded; i++) {
+          try {
+            await api.mark_spoken({ id: next.id, mode: spokenMode });
+            recorded = true;
+          } catch {
+            if (i < 2) await new Promise((r) => setTimeout(r, 1000));
+          }
+        }
+        if (recorded) {
+          failure = null;
+          queryClient.invalidateQueries({ queryKey: ["state"] });
+          queryClient.invalidateQueries({ queryKey: ["outbox"] });
+        } else {
+          failure = new Error(
+            "The message was spoken, but recording it failed.",
+          );
+        }
+      }
+      if (failure !== null && liveRef.current) {
+        setError(
+          failure instanceof Error
+            ? failure.message
+            : "A message could not be spoken.",
+        );
+      }
+      speakingRef.current = false;
     })();
   }, [outbox.data, live, queryClient]);
 

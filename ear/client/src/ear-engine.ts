@@ -29,6 +29,22 @@
 //     talking over a busy channel after a fixed deadline; a ping that
 //     cannot find a clear channel is skipped, and a message that
 //     cannot is reported as an error so it stays queued.
+//
+// First-exchange fix (2026-11-26, after both phones buzzed without a
+// single message crossing):
+//   * decode scans are capped to a recent window and duty-cycled:
+//     a full 14 s scan takes seconds of solid main-thread CPU on a
+//     phone, and at the old rate the decoder crowded out the outbox
+//     poll and the listen-before-talk sampling, so speech kept
+//     failing its clear-channel check and nothing was ever sent.
+//     Scans now cover the most recent seconds (a burst is re-scanned
+//     on consecutive attempts while it is in the window) and the gap
+//     between attempts grows with how long the last attempt took, so
+//     decoding never owns the thread.
+//   * when there is no usable room sounding, speech falls back to
+//     Mode B (strong Reed–Solomon, the robust profile) instead of
+//     Mode A (fast but fragile in a real room). The peer decodes any
+//     mode, so this is a purely local transmission choice.
 
 import {
 analyze_channel,
@@ -66,7 +82,11 @@ const RING_SECONDS = 15;
 const GUARD_TAIL_SECONDS = 1;
 const DETECT_EVERY_MS = 800;
 const MIN_WINDOW_SECONDS = 2.5;
-const MAX_WINDOW_SECONDS = 14;
+// Scan only the recent seconds: a burst stays inside this window for
+// many consecutive attempts, and a shorter window is far cheaper to
+// scan — the saving is what leaves the main thread free for polling,
+// playback and listen-before-talk.
+const MAX_WINDOW_SECONDS = 8;
 const SEEN_WINDOW_MS = 10 * 60 * 1000;
 
 function resample(samples: Float32Array, from: number, to: number): Float32Array {
@@ -104,6 +124,7 @@ export class EarEngine {
   private presenceTimer: number | null = null;
   private decoding = false;
   private lastAttemptAt = 0;
+  private attemptGapMs = 1200;
   private cooldownUntil = 0;
 
   private lastFailedKey = "";
@@ -314,7 +335,7 @@ export class EarEngine {
     if (this.state !== "listening" || this.decoding) return;
     const now = performance.now();
     if (now < this.cooldownUntil) return;
-    if (now - this.lastAttemptAt < 1200) return;
+    if (now - this.lastAttemptAt < this.attemptGapMs) return;
     const filled = Math.min(this.totalWritten / SR, RING_SECONDS);
     if (filled < MIN_WINDOW_SECONDS) return;
     const seconds = Math.min(filled, MAX_WINDOW_SECONDS);
@@ -390,6 +411,12 @@ export class EarEngine {
     } catch {
       // No burst in this window — the normal case for room noise.
     } finally {
+      // Duty-cycle the decoder: the next attempt waits at least as
+      // long as this one took (bounded), so scanning can never
+      // consume more than about half the main thread and the page's
+      // polling, playback and channel checks stay responsive.
+      const tookMs = performance.now() - now;
+      this.attemptGapMs = Math.min(6000, Math.max(1200, Math.ceil(tookMs)));
       this.decoding = false;
       if (this.getState() !== "idle") this.setState("listening");
     }
@@ -577,12 +604,15 @@ export class EarEngine {
         samples = auto;
         mode = autoMode;
       } else {
-        samples = encode_adaptive(data, "A");
-        mode = "A";
+        // The sounding read as unusable (encode_auto returned no
+        // burst): fall back to Mode B, whose heavy Reed–Solomon
+        // survives a real room, rather than fragile Mode A.
+        samples = encode_adaptive(data, "B");
+        mode = "B";
       }
     } else {
-      samples = encode_adaptive(data, "A");
-      mode = "A";
+      samples = encode_adaptive(data, "B");
+      mode = "B";
     }
     this.recentSent.push({ crc: crc32(data), at: Date.now() });
     if (this.recentSent.length > 20) this.recentSent.shift();

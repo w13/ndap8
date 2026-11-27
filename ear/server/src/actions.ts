@@ -8,6 +8,9 @@
 //
 // The page itself uses these:
 //   poll_outbox    — claim the next queued text to speak + session state
+//   renew_claim    — a page that is retrying a speak refreshes its
+//     claim lease, so the message stays exclusively its own for
+//     exactly as long as it is actively trying (and no longer)
 //   mark_spoken    — the page finished playing a claimed outbox item
 //   report_heard   — the page decoded an incoming burst (deduped here)
 //   report_failed  — the page heard a burst it could not decode
@@ -39,7 +42,14 @@ import { and, asc, desc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm";
 import * as schema from "./schema";
 
 const DEDUPE_WINDOW_MS = 10 * 60 * 1000;
-const CLAIM_STALE_MS = 90 * 1000;
+// One full speak attempt (listen-before-talk ~22 s worst case plus
+// playback) fits inside this window with margin; the old 90 s left a
+// message stranded for a minute and a half whenever a claim's page
+// died or its speak failed, which is how the first exchange stalled.
+// A page that is actively retrying a speak renews its claim
+// (renew_claim) before each attempt, so exclusivity lasts exactly as
+// long as the retrying page lives — and lapses 45 s after it stops.
+const CLAIM_STALE_MS = 45 * 1000;
 const OUTBOX_TTL_MS = 15 * 60 * 1000;
 const LISTENING_FRESH_MS = 45 * 1000;
 const FAILED_CAP_PER_HOUR = 30;
@@ -331,6 +341,27 @@ export const Actions = {
         recommended_mode: s?.recommendedMode ?? null,
         pending,
       };
+    },
+  }),
+
+  renew_claim: defineAction({
+    description:
+      "For the Ear page: refreshes the claim timestamp on a claimed outbox text, so a page that is actively retrying a speak keeps exclusive ownership of the message; returns ok=false when the row is no longer claimed (already spoken, expired, or taken over after a stale claim).",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({ ok: z.boolean() }),
+    async handler(ctx, args): Promise<{ ok: boolean }> {
+      const db = ctx.db<typeof schema>();
+      const renewed = await db
+        .update(schema.outbox)
+        .set({ claimedAt: new Date() })
+        .where(
+          and(
+            eq(schema.outbox.id, args.id),
+            eq(schema.outbox.status, "claimed"),
+          ),
+        )
+        .returning({ id: schema.outbox.id });
+      return { ok: renewed.length > 0 };
     },
   }),
 
